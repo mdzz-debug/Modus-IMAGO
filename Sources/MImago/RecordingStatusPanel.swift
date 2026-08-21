@@ -82,6 +82,10 @@ private struct RecordingStatusView: View {
                 onStop()
             }
             .frame(width: 126)
+            .delayedFormaHelp(
+                "停止并保存",
+                detail: "结束当前录屏并写入已选择的保存位置"
+            )
         }
         .padding(14)
         .frame(width: 320, height: 86)

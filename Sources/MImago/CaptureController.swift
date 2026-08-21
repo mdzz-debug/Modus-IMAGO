@@ -117,11 +117,30 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
     }
 
     func takeFreeScreenshot(_ result: CaptureSelectionResult) {
-        statusMessage = "正在处理选区…"
+        statusMessage = result.action == .longScreenshot ? "正在截取长图…" : "正在处理选区…"
         Task { [weak self] in
             defer { self?.restoreWindowsHiddenForCapture() }
             do {
                 try await Task.sleep(for: .milliseconds(120))
+
+                if result.action == .longScreenshot {
+                    guard case let .window(windowID, processID) = result.target else {
+                        throw CaptureError.longScreenshotRequiresWindow
+                    }
+                    let longImage = try await Self.captureLongWindowImage(
+                        windowID: windowID,
+                        processID: processID,
+                        progress: { page in
+                            self?.statusMessage = "正在拼接长图 · 第 \(page) 屏"
+                        }
+                    )
+                    try self?.finishScreenshot(
+                        longImage,
+                        completion: CapturePreferences.shared.screenshotCompletion
+                    )
+                    self?.statusMessage = "长截图已完成"
+                    return
+                }
 
                 let captured: CGImage
                 switch result.target {
@@ -151,7 +170,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
                 }
             } catch {
                 self?.statusMessage = Self.captureFailureMessage(
-                    prefix: "自由截图失败",
+                    prefix: result.action == .longScreenshot ? "长截图失败" : "自由截图失败",
                     error: error
                 )
             }
@@ -650,6 +669,427 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         )
     }
 
+    private struct ScrollCaptureTarget {
+        let scrollArea: AXUIElement
+        let scrollBar: AXUIElement
+        let frame: CGRect
+    }
+
+    private static func captureLongWindowImage(
+        windowID: CGWindowID,
+        processID: pid_t,
+        progress: @escaping @MainActor (Int) -> Void
+    ) async throws -> CGImage {
+        raiseWindow(windowID: windowID, processID: processID)
+        try await Task.sleep(for: .milliseconds(260))
+
+        guard let windowFrame = windowFrame(windowID: windowID),
+              windowFrame.width > 0,
+              windowFrame.height > 0 else {
+            throw CaptureError.windowUnavailable
+        }
+
+        if let windowElement = accessibilityWindow(
+            windowID: windowID,
+            processID: processID
+        ),
+           let target = largestScrollableArea(in: windowElement) {
+            return try await captureLongWindowUsingScrollBar(
+                target,
+                windowID: windowID,
+                processID: processID,
+                windowFrame: windowFrame,
+                progress: progress
+            )
+        }
+
+        return try await captureLongWindowUsingScrollEvents(
+            windowID: windowID,
+            processID: processID,
+            windowFrame: windowFrame,
+            progress: progress
+        )
+    }
+
+    private static func captureLongWindowUsingScrollBar(
+        _ target: ScrollCaptureTarget,
+        windowID: CGWindowID,
+        processID: pid_t,
+        windowFrame: CGRect,
+        progress: @escaping @MainActor (Int) -> Void
+    ) async throws -> CGImage {
+        let minimumValue = accessibilityNumber(target.scrollBar, attribute: kAXMinValueAttribute) ?? 0
+        let maximumValue = accessibilityNumber(target.scrollBar, attribute: kAXMaxValueAttribute) ?? 1
+        let originalValue = accessibilityNumber(target.scrollBar, attribute: kAXValueAttribute) ?? minimumValue
+        guard maximumValue - minimumValue > 0.0001 else {
+            throw CaptureError.scrollableContentUnavailable
+        }
+
+        defer {
+            _ = AXUIElementSetAttributeValue(
+                target.scrollBar,
+                kAXValueAttribute as CFString,
+                NSNumber(value: originalValue)
+            )
+        }
+
+        let captureCount = 25
+        var frames: [CGImage] = []
+        for index in 0..<captureCount {
+            try Task.checkCancellation()
+            let progressValue = Double(index) / Double(captureCount - 1)
+            let value = minimumValue + (maximumValue - minimumValue) * progressValue
+            let setResult = AXUIElementSetAttributeValue(
+                target.scrollBar,
+                kAXValueAttribute as CFString,
+                NSNumber(value: value)
+            )
+            guard setResult == .success else {
+                throw CaptureError.accessibilityPermissionRequired
+            }
+            try await Task.sleep(for: .milliseconds(index == 0 ? 180 : 85))
+            let windowImage = try await captureWindowImage(
+                windowID: windowID,
+                processID: processID
+            )
+            let cropped = try cropScrollableArea(
+                target.frame,
+                from: windowImage,
+                windowFrame: windowFrame
+            )
+            frames.append(cropped)
+            progress(index + 1)
+        }
+
+        return try stitchVerticalFrames(frames)
+    }
+
+    private static func captureLongWindowUsingScrollEvents(
+        windowID: CGWindowID,
+        processID: pid_t,
+        windowFrame: CGRect,
+        progress: @escaping @MainActor (Int) -> Void
+    ) async throws -> CGImage {
+        guard CGPreflightPostEventAccess() else {
+            let permission = await MImagoPermissions.shared.center.request(.accessibility)
+            guard permission == .authorized, CGPreflightPostEventAccess() else {
+                throw CaptureError.accessibilityPermissionRequired
+            }
+            return try await captureLongWindowUsingScrollEvents(
+                windowID: windowID,
+                processID: processID,
+                windowFrame: windowFrame,
+                progress: progress
+            )
+        }
+
+        var frames: [CGImage] = []
+        var unchangedCount = 0
+        let maximumFrames = 28
+        for index in 0..<maximumFrames {
+            try Task.checkCancellation()
+            let frame = try await captureWindowImage(
+                windowID: windowID,
+                processID: processID
+            )
+            if let previous = frames.last {
+                let shift = try detectedVerticalShift(from: previous, to: frame)
+                if shift < 2 {
+                    unchangedCount += 1
+                } else {
+                    unchangedCount = 0
+                }
+                if unchangedCount >= 2 { break }
+            }
+            frames.append(frame)
+            progress(frames.count)
+
+            guard index < maximumFrames - 1 else { break }
+            guard let event = CGEvent(
+                scrollWheelEvent2Source: nil,
+                units: .pixel,
+                wheelCount: 1,
+                wheel1: -Int32(max(180, windowFrame.height * 0.72)),
+                wheel2: 0,
+                wheel3: 0
+            ) else {
+                throw CaptureError.scrollableContentUnavailable
+            }
+            event.location = CGPoint(x: windowFrame.midX, y: windowFrame.midY)
+            event.postToPid(processID)
+            try await Task.sleep(for: .milliseconds(150))
+        }
+
+        return try stitchVerticalFrames(frames)
+    }
+
+    private static func accessibilityWindow(
+        windowID: CGWindowID,
+        processID: pid_t
+    ) -> AXUIElement? {
+        let targetFrame = windowFrame(windowID: windowID)
+        let targetTitle = windowTitle(windowID: windowID)
+        let application = AXUIElementCreateApplication(processID)
+        var rawWindows: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            application,
+            kAXWindowsAttribute as CFString,
+            &rawWindows
+        ) == .success,
+              let windows = rawWindows as? [AXUIElement] else { return nil }
+
+        return windows.first { window in
+            var rawWindowNumber: CFTypeRef?
+            let copiedWindowNumber = AXUIElementCopyAttributeValue(
+                window,
+                "AXWindowNumber" as CFString,
+                &rawWindowNumber
+            ) == .success
+            let hasMatchingWindowNumber = copiedWindowNumber
+                && (rawWindowNumber as? NSNumber).map { CGWindowID($0.uint32Value) == windowID } == true
+            let hasMatchingFrame = targetFrame.map { axWindowFrame(window).approximatelyEquals($0) } == true
+            let hasMatchingTitle = targetTitle.map { axWindowTitle(window) == $0 } == true
+            return hasMatchingWindowNumber || hasMatchingFrame || hasMatchingTitle
+        }
+    }
+
+    private static func largestScrollableArea(
+        in root: AXUIElement
+    ) -> ScrollCaptureTarget? {
+        var best: ScrollCaptureTarget?
+
+        func visit(_ element: AXUIElement, depth: Int) {
+            guard depth < 18 else { return }
+            var rawScrollBar: CFTypeRef?
+            if AXUIElementCopyAttributeValue(
+                element,
+                kAXVerticalScrollBarAttribute as CFString,
+                &rawScrollBar
+            ) == .success,
+               let scrollBar = rawScrollBar,
+               CFGetTypeID(scrollBar) == AXUIElementGetTypeID() {
+                let resolvedScrollBar = unsafeDowncast(scrollBar, to: AXUIElement.self)
+                var isSettable = DarwinBoolean(false)
+                let canSetValue = AXUIElementIsAttributeSettable(
+                    resolvedScrollBar,
+                    kAXValueAttribute as CFString,
+                    &isSettable
+                ) == .success && isSettable.boolValue
+                let frame = axWindowFrame(element)
+                if canSetValue,
+                   frame.width >= 120,
+                   frame.height >= 120,
+                   frame.area > (best?.frame.area ?? 0) {
+                    best = ScrollCaptureTarget(
+                        scrollArea: element,
+                        scrollBar: resolvedScrollBar,
+                        frame: frame
+                    )
+                }
+            }
+
+            var rawChildren: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(
+                element,
+                kAXChildrenAttribute as CFString,
+                &rawChildren
+            ) == .success,
+                  let children = rawChildren as? [AXUIElement] else { return }
+            for child in children {
+                visit(child, depth: depth + 1)
+            }
+        }
+
+        visit(root, depth: 0)
+        return best
+    }
+
+    private static func accessibilityNumber(
+        _ element: AXUIElement,
+        attribute: String
+    ) -> Double? {
+        var rawValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            attribute as CFString,
+            &rawValue
+        ) == .success else { return nil }
+        return (rawValue as? NSNumber)?.doubleValue
+    }
+
+    nonisolated private static func cropScrollableArea(
+        _ scrollFrame: CGRect,
+        from image: CGImage,
+        windowFrame: CGRect
+    ) throws -> CGImage {
+        let scaleX = CGFloat(image.width) / max(1, windowFrame.width)
+        let scaleY = CGFloat(image.height) / max(1, windowFrame.height)
+        let relative = CGRect(
+            x: (scrollFrame.minX - windowFrame.minX) * scaleX,
+            y: CGFloat(image.height) - (scrollFrame.maxY - windowFrame.minY) * scaleY,
+            width: scrollFrame.width * scaleX,
+            height: scrollFrame.height * scaleY
+        ).integral.intersection(
+            CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        )
+        guard relative.width >= 20,
+              relative.height >= 20,
+              let cropped = image.cropping(to: relative) else {
+            throw CaptureError.scrollableContentUnavailable
+        }
+        return cropped
+    }
+
+    nonisolated private static func stitchVerticalFrames(
+        _ frames: [CGImage]
+    ) throws -> CGImage {
+        guard let first = frames.first else { throw CaptureError.imageUnavailable }
+        var strips: [(image: CGImage, height: Int)] = []
+        var previous = first
+
+        for next in frames.dropFirst() {
+            let shift = try detectedVerticalShift(from: previous, to: next)
+            guard shift >= 2 else { continue }
+            let stripHeight = min(shift, next.height)
+            guard let strip = next.cropping(
+                to: CGRect(x: 0, y: 0, width: next.width, height: stripHeight)
+            ) else { continue }
+            strips.append((strip, stripHeight))
+            previous = next
+        }
+
+        guard !strips.isEmpty else { throw CaptureError.longScreenshotNoMovement }
+        let totalHeight = first.height + strips.reduce(0) { $0 + $1.height }
+        guard totalHeight <= 60_000,
+              let context = CGContext(
+                data: nil,
+                width: first.width,
+                height: totalHeight,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else {
+            throw CaptureError.longScreenshotTooLarge
+        }
+
+        context.interpolationQuality = .high
+        var cursorY = totalHeight - first.height
+        context.draw(
+            first,
+            in: CGRect(x: 0, y: cursorY, width: first.width, height: first.height)
+        )
+        for strip in strips {
+            cursorY -= strip.height
+            context.draw(
+                strip.image,
+                in: CGRect(x: 0, y: cursorY, width: first.width, height: strip.height)
+            )
+        }
+        guard let result = context.makeImage() else {
+            throw CaptureError.imageEncodingFailed
+        }
+        return result
+    }
+
+    nonisolated private static func detectedVerticalShift(
+        from previous: CGImage,
+        to next: CGImage
+    ) throws -> Int {
+        let sampleWidth = min(220, previous.width, next.width)
+        let scale = CGFloat(sampleWidth) / CGFloat(max(1, min(previous.width, next.width)))
+        let sampleHeight = max(40, Int(CGFloat(min(previous.height, next.height)) * scale))
+        let previousPixels = try topDownRGBABytes(
+            previous,
+            width: sampleWidth,
+            height: sampleHeight
+        )
+        let nextPixels = try topDownRGBABytes(
+            next,
+            width: sampleWidth,
+            height: sampleHeight
+        )
+
+        var samePositionDifference: UInt64 = 0
+        var samePositionSamples: UInt64 = 0
+        var sameY = 3
+        while sameY < sampleHeight - 3 {
+            var sameX = 3
+            while sameX < sampleWidth - 3 {
+                let index = (sameY * sampleWidth + sameX) * 4
+                samePositionDifference += UInt64(abs(Int(previousPixels[index]) - Int(nextPixels[index])))
+                samePositionDifference += UInt64(abs(Int(previousPixels[index + 1]) - Int(nextPixels[index + 1])))
+                samePositionDifference += UInt64(abs(Int(previousPixels[index + 2]) - Int(nextPixels[index + 2])))
+                samePositionSamples += 3
+                sameX += 7
+            }
+            sameY += 7
+        }
+        if samePositionSamples > 0,
+           Double(samePositionDifference) / Double(samePositionSamples) < 0.8 {
+            return 0
+        }
+
+        let minimumShift = max(1, sampleHeight / 160)
+        let maximumShift = max(minimumShift, Int(CGFloat(sampleHeight) * 0.88))
+        var bestShift = minimumShift
+        var bestScore = Double.greatestFiniteMagnitude
+
+        for shift in minimumShift...maximumShift {
+            let overlap = sampleHeight - shift
+            guard overlap >= 12 else { continue }
+            var difference: UInt64 = 0
+            var samples: UInt64 = 0
+            var y = 3
+            while y < overlap - 3 {
+                var x = 3
+                while x < sampleWidth - 3 {
+                    let previousIndex = ((y + shift) * sampleWidth + x) * 4
+                    let nextIndex = (y * sampleWidth + x) * 4
+                    difference += UInt64(abs(Int(previousPixels[previousIndex]) - Int(nextPixels[nextIndex])))
+                    difference += UInt64(abs(Int(previousPixels[previousIndex + 1]) - Int(nextPixels[nextIndex + 1])))
+                    difference += UInt64(abs(Int(previousPixels[previousIndex + 2]) - Int(nextPixels[nextIndex + 2])))
+                    samples += 3
+                    x += 7
+                }
+                y += 7
+            }
+            guard samples > 0 else { continue }
+            let score = Double(difference) / Double(samples)
+            if score < bestScore {
+                bestScore = score
+                bestShift = shift
+            }
+        }
+
+        let originalHeight = min(previous.height, next.height)
+        return max(1, Int((CGFloat(bestShift) / CGFloat(sampleHeight) * CGFloat(originalHeight)).rounded()))
+    }
+
+    nonisolated private static func topDownRGBABytes(
+        _ image: CGImage,
+        width: Int,
+        height: Int
+    ) throws -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        guard let context = CGContext(
+            data: &bytes,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw CaptureError.imageEncodingFailed
+        }
+        context.interpolationQuality = .low
+        context.translateBy(x: 0, y: CGFloat(height))
+        context.scaleBy(x: 1, y: -1)
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return bytes
+    }
+
     private static func raiseWindow(windowID: CGWindowID, processID: pid_t) {
         NSRunningApplication(processIdentifier: processID)?
             .activate(options: [.activateAllWindows])
@@ -791,6 +1231,36 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         context.setLineCap(.round)
         context.setLineJoin(.round)
 
+        let highlightAnnotations = annotations.filter { $0.kind == .highlight }
+        if !highlightAnnotations.isEmpty {
+            context.saveGState()
+            context.setFillColor(CGColor(gray: 0, alpha: 0.54))
+            context.fill(canvas)
+            for annotation in highlightAnnotations {
+                let start = CGPoint(
+                    x: annotation.start.x * CGFloat(image.width),
+                    y: (1 - annotation.start.y) * CGFloat(image.height)
+                )
+                let end = CGPoint(
+                    x: annotation.end.x * CGFloat(image.width),
+                    y: (1 - annotation.end.y) * CGFloat(image.height)
+                )
+                let highlightRect = CGRect(
+                    x: min(start.x, end.x),
+                    y: min(start.y, end.y),
+                    width: abs(start.x - end.x),
+                    height: abs(start.y - end.y)
+                )
+                context.saveGState()
+                context.clip(to: highlightRect)
+                context.draw(image, in: canvas)
+                context.restoreGState()
+            }
+            context.restoreGState()
+        }
+
+        var mosaicCache: [CaptureAnnotationThickness: CGImage] = [:]
+
         for annotation in annotations {
             let renderScale = max(1, min(3, CGFloat(image.width) / 1000))
             context.setStrokeColor(annotation.color.cgColor)
@@ -804,7 +1274,56 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
                 x: annotation.end.x * CGFloat(image.width),
                 y: (1 - annotation.end.y) * CGFloat(image.height)
             )
-            if annotation.kind == .text {
+            if annotation.kind == .highlight {
+                continue
+            } else if annotation.kind == .mosaic {
+                let pixelated: CGImage
+                if let cached = mosaicCache[annotation.thickness] {
+                    pixelated = cached
+                } else {
+                    let blockSize = switch annotation.thickness {
+                    case .thin: 9
+                    case .medium: 14
+                    case .thick: 22
+                    }
+                    pixelated = try pixelatedImage(image, blockSize: blockSize)
+                    mosaicCache[annotation.thickness] = pixelated
+                }
+
+                let normalizedPoints = annotation.points.isEmpty
+                    ? [annotation.start, annotation.end]
+                    : annotation.points
+                guard let firstPoint = normalizedPoints.first else { continue }
+                let brushPath = CGMutablePath()
+                brushPath.move(
+                    to: CGPoint(
+                        x: firstPoint.x * CGFloat(image.width),
+                        y: (1 - firstPoint.y) * CGFloat(image.height)
+                    )
+                )
+                for point in normalizedPoints.dropFirst() {
+                    brushPath.addLine(
+                        to: CGPoint(
+                            x: point.x * CGFloat(image.width),
+                            y: (1 - point.y) * CGFloat(image.height)
+                        )
+                    )
+                }
+                let clippedPath = brushPath.copy(
+                    strokingWithWidth: annotation.thickness.mosaicWidth * renderScale,
+                    lineCap: .round,
+                    lineJoin: .round,
+                    miterLimit: 0
+                )
+                context.saveGState()
+                context.addPath(clippedPath)
+                context.clip()
+                context.interpolationQuality = .none
+                context.draw(pixelated, in: canvas)
+                context.restoreGState()
+                context.interpolationQuality = .high
+                continue
+            } else if annotation.kind == .text {
                 guard let text = annotation.text, !text.isEmpty else { continue }
                 let fontSize = (annotation.textSize?.rawValue
                     ?? annotation.thickness.textFontSize) * renderScale
@@ -898,6 +1417,51 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         return result
     }
 
+    nonisolated private static func pixelatedImage(
+        _ image: CGImage,
+        blockSize: Int
+    ) throws -> CGImage {
+        let smallWidth = max(1, image.width / max(2, blockSize))
+        let smallHeight = max(1, image.height / max(2, blockSize))
+        guard let smallContext = CGContext(
+            data: nil,
+            width: smallWidth,
+            height: smallHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw CaptureError.imageEncodingFailed
+        }
+        smallContext.interpolationQuality = .none
+        smallContext.draw(
+            image,
+            in: CGRect(x: 0, y: 0, width: smallWidth, height: smallHeight)
+        )
+        guard let reduced = smallContext.makeImage(),
+              let outputContext = CGContext(
+                data: nil,
+                width: image.width,
+                height: image.height,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else {
+            throw CaptureError.imageEncodingFailed
+        }
+        outputContext.interpolationQuality = .none
+        outputContext.draw(
+            reduced,
+            in: CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        )
+        guard let result = outputContext.makeImage() else {
+            throw CaptureError.imageEncodingFailed
+        }
+        return result
+    }
+
     private func restoreWindowsHiddenForCapture() {
         AppDelegate.shared?.setCaptureOverlayActive(false)
         windowsHiddenForCapture.forEach { window in
@@ -958,6 +1522,11 @@ private enum CaptureError: LocalizedError {
     case saveDirectoryRequired
     case invalidSelection
     case windowUnavailable
+    case longScreenshotRequiresWindow
+    case scrollableContentUnavailable
+    case accessibilityPermissionRequired
+    case longScreenshotNoMovement
+    case longScreenshotTooLarge
 
     var errorDescription: String? {
         switch self {
@@ -967,6 +1536,11 @@ private enum CaptureError: LocalizedError {
         case .saveDirectoryRequired: "请先选择公共保存位置。"
         case .invalidSelection: "请选择有效的截图区域。"
         case .windowUnavailable: "选中的窗口已经关闭或暂时不可捕获。"
+        case .longScreenshotRequiresWindow: "截长图需要先单击选择一个窗口。"
+        case .scrollableContentUnavailable: "没有在选中窗口中找到可滚动区域。"
+        case .accessibilityPermissionRequired: "截长图需要在系统设置中开启辅助功能权限。"
+        case .longScreenshotNoMovement: "窗口内容没有发生滚动，无法生成长图。"
+        case .longScreenshotTooLarge: "长图尺寸超过当前版本的安全限制。"
         }
     }
 }

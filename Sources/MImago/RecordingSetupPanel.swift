@@ -109,12 +109,20 @@ struct RecordingSetupPanelView: View {
                     selection: $recordingPreferences.quality,
                     size: .medium
                 )
+                .delayedFormaHelp(
+                    "录制清晰度",
+                    detail: "选择自适应 1080p、720p 或原始分辨率"
+                )
                 .zIndex(60)
                 FormaDropdown(
                     "帧率",
                     items: RecordingFPS.allCases,
                     selection: $recordingPreferences.frameRate,
                     size: .medium
+                )
+                .delayedFormaHelp(
+                    "录制帧率",
+                    detail: "选择每秒 15、30 或 60 帧；帧率越高文件通常越大"
                 )
                 .zIndex(50)
             }
@@ -127,12 +135,20 @@ struct RecordingSetupPanelView: View {
                     selection: $recordingPreferences.format,
                     size: .medium
                 )
+                .delayedFormaHelp(
+                    "视频格式",
+                    detail: "选择导出为 MP4 或 MOV 文件"
+                )
                 .zIndex(40)
                 FormaDropdown(
                     "倒计时",
                     items: RecordingCountdown.allCases,
                     selection: $recordingPreferences.countdown,
                     size: .medium
+                )
+                .delayedFormaHelp(
+                    "开始倒计时",
+                    detail: "录制前显示 3 秒、5 秒倒计时，或立即开始"
                 )
                 .zIndex(30)
             }
@@ -144,6 +160,10 @@ struct RecordingSetupPanelView: View {
                     items: RecordingDuration.allCases,
                     selection: $recordingPreferences.duration,
                     size: .medium
+                )
+                .delayedFormaHelp(
+                    "最长录制时长",
+                    detail: "到达设定时长后自动停止并保存；不限时则手动停止"
                 )
                 .zIndex(20)
 
@@ -175,6 +195,10 @@ struct RecordingSetupPanelView: View {
                 isOn: $recordingPreferences.capturesSystemAudio,
                 size: .small
             )
+            .delayedFormaHelp(
+                "系统声音",
+                detail: "录入应用播放和系统播放的声音"
+            )
             FormaSwitch(
                 "麦克风",
                 detail: "使用系统默认输入设备",
@@ -183,6 +207,10 @@ struct RecordingSetupPanelView: View {
                 isOn: microphoneBinding,
                 size: .small
             )
+            .delayedFormaHelp(
+                "麦克风",
+                detail: "录入系统默认麦克风；首次开启会检查权限"
+            )
             FormaSwitch(
                 "鼠标点击",
                 onSystemImage: "cursorarrow.click.2",
@@ -190,12 +218,20 @@ struct RecordingSetupPanelView: View {
                 isOn: $recordingPreferences.showsMouseClicks,
                 size: .small
             )
+            .delayedFormaHelp(
+                "鼠标点击提示",
+                detail: "在视频中显示鼠标点击的视觉反馈"
+            )
             FormaSwitch(
                 "显示光标",
                 onSystemImage: "cursorarrow",
                 offSystemImage: "cursorarrow.slash",
                 isOn: $recordingPreferences.showsCursor,
                 size: .small
+            )
+            .delayedFormaHelp(
+                "显示光标",
+                detail: "决定录制画面中是否包含鼠标指针"
             )
         }
         .frame(width: 250)
@@ -233,6 +269,10 @@ struct RecordingSetupPanelView: View {
                 onStart(recordingPreferences.options)
             }
             .frame(width: 140)
+            .delayedFormaHelp(
+                "开始录制",
+                detail: "按当前参数启动倒计时并开始录屏"
+            )
 
             FormaButton(
                 "取消",
@@ -243,6 +283,10 @@ struct RecordingSetupPanelView: View {
                 onCancel()
             }
             .frame(width: 140)
+            .delayedFormaHelp(
+                "取消录制",
+                detail: "关闭录屏选区并返回主窗口"
+            )
         }
         .frame(width: 140, height: 148)
     }

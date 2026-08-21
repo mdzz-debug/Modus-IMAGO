@@ -14,6 +14,8 @@ enum CaptureAnnotationKind: Sendable, Hashable {
     case line
     case arrow
     case text
+    case mosaic
+    case highlight
 }
 
 enum CaptureAnnotationColor: String, CaseIterable, Sendable, Hashable {
@@ -68,6 +70,14 @@ enum CaptureAnnotationThickness: CGFloat, CaseIterable, Sendable, Hashable, Cust
         case .thin: 15
         case .medium: 19
         case .thick: 25
+        }
+    }
+
+    var mosaicWidth: CGFloat {
+        switch self {
+        case .thin: 16
+        case .medium: 28
+        case .thick: 44
         }
     }
 }
@@ -132,6 +142,7 @@ struct CaptureAnnotation: Sendable, Hashable {
     let text: String?
     let textSize: CaptureTextSize?
     let textBackground: CaptureTextBackground?
+    let points: [CGPoint]
 }
 
 enum CaptureSelectionTarget: Sendable, Hashable {
@@ -148,6 +159,7 @@ struct CaptureSelectionResult: Sendable, Hashable {
 enum CaptureResultAction: Sendable, Hashable {
     case finish
     case pin
+    case longScreenshot
 }
 
 private enum CaptureOverlayPurpose: Sendable, Hashable {
@@ -419,6 +431,8 @@ private enum CaptureOverlayTool: Sendable, Hashable {
     case line
     case arrow
     case text
+    case mosaic
+    case highlight
 }
 
 private enum ConfirmedOverlaySelection: Sendable, Hashable {
@@ -434,6 +448,11 @@ private enum ConfirmedOverlaySelection: Sendable, Hashable {
 
     var isRegion: Bool {
         if case .region = self { return true }
+        return false
+    }
+
+    var isWindow: Bool {
+        if case .window = self { return true }
         return false
     }
 }
@@ -472,6 +491,7 @@ private struct OverlayAnnotation: Identifiable, Sendable, Hashable {
     var text: String?
     var textSize: CaptureTextSize?
     var textBackground: CaptureTextBackground?
+    var points: [CGPoint]
 
     init(
         id: UUID = UUID(),
@@ -482,7 +502,8 @@ private struct OverlayAnnotation: Identifiable, Sendable, Hashable {
         thickness: CaptureAnnotationThickness,
         text: String?,
         textSize: CaptureTextSize? = nil,
-        textBackground: CaptureTextBackground? = nil
+        textBackground: CaptureTextBackground? = nil,
+        points: [CGPoint] = []
     ) {
         self.id = id
         self.kind = kind
@@ -493,6 +514,7 @@ private struct OverlayAnnotation: Identifiable, Sendable, Hashable {
         self.text = text
         self.textSize = textSize
         self.textBackground = textBackground
+        self.points = points
     }
 }
 
@@ -737,13 +759,15 @@ private struct FreeSelectionOverlayView: View {
                 }
 
                 switch activeTool {
-                case .rectangle, .ellipse, .line, .arrow:
+                case .rectangle, .ellipse, .line, .arrow, .highlight:
                     let kind: CaptureAnnotationKind = switch activeTool {
                     case .rectangle: .rectangle
                     case .ellipse: .ellipse
                     case .line: .line
                     case .arrow: .arrow
                     case .text: .text
+                    case .mosaic: .mosaic
+                    case .highlight: .highlight
                     }
                     annotationDraft = OverlayAnnotation(
                         kind: kind,
@@ -753,6 +777,26 @@ private struct FreeSelectionOverlayView: View {
                         thickness: annotationThickness,
                         text: nil
                     )
+                case .mosaic:
+                    let location = clamped(value.location, to: selection)
+                    if var draft = annotationDraft {
+                        if draft.points.last.map({ hypot($0.x - location.x, $0.y - location.y) >= 2 }) != false {
+                            draft.points.append(location)
+                            draft.end = location
+                            annotationDraft = draft
+                        }
+                    } else {
+                        let start = clamped(value.startLocation, to: selection)
+                        annotationDraft = OverlayAnnotation(
+                            kind: .mosaic,
+                            start: start,
+                            end: location,
+                            color: .black,
+                            thickness: annotationThickness,
+                            text: nil,
+                            points: [start, location]
+                        )
+                    }
                 case .text:
                     break
                 }
@@ -809,9 +853,16 @@ private struct FreeSelectionOverlayView: View {
 
                 guard let activeTool else { return }
                 switch activeTool {
-                case .rectangle, .ellipse, .line, .arrow:
+                case .rectangle, .ellipse, .line, .arrow, .highlight:
                     guard let draft = annotationDraft else { return }
                     if hypot(draft.end.x - draft.start.x, draft.end.y - draft.start.y) >= 3 {
+                        annotations.append(draft)
+                        selectedAnnotationID = draft.id
+                    }
+                    annotationDraft = nil
+                case .mosaic:
+                    guard let draft = annotationDraft else { return }
+                    if draft.points.count >= 2 {
                         annotations.append(draft)
                         selectedAnnotationID = draft.id
                     }
@@ -915,25 +966,81 @@ private struct FreeSelectionOverlayView: View {
     @ViewBuilder
     private func screenshotToolbar(at position: CGPoint, in bounds: CGRect) -> some View {
         HStack(spacing: 7) {
-            toolButton("rectangle.dashed", label: "矩形标注", tool: .rectangle, showsStylePanel: true)
-            toolButton("circle.dashed", label: "圆圈标注", tool: .ellipse, showsStylePanel: true)
-            toolButton("line.diagonal", label: "画线", tool: .line, showsStylePanel: true)
-            toolButton("arrow.up.right", label: "画箭头", tool: .arrow, showsStylePanel: true)
-            toolButton("character.cursor.ibeam", label: "文字标注", tool: .text, showsStylePanel: true)
-            actionButton("pin", label: "置顶截图", role: .secondary) {
+            toolButton(
+                "rectangle.dashed",
+                label: "矩形标注",
+                help: "拖拽绘制矩形；二级工具栏可调整颜色和粗细",
+                tool: .rectangle,
+                showsStylePanel: true
+            )
+            toolButton(
+                "circle.dashed",
+                label: "圆圈标注",
+                help: "拖拽绘制圆圈；二级工具栏可调整颜色和粗细",
+                tool: .ellipse,
+                showsStylePanel: true
+            )
+            toolButton(
+                "line.diagonal",
+                label: "画线",
+                help: "按住鼠标拖拽绘制直线",
+                tool: .line,
+                showsStylePanel: true
+            )
+            toolButton(
+                "arrow.up.right",
+                label: "画箭头",
+                help: "从起点拖向重点位置绘制箭头",
+                tool: .arrow,
+                showsStylePanel: true
+            )
+            toolButton(
+                "character.cursor.ibeam",
+                label: "文字标注",
+                help: "点击截图输入文字；可再次点击文字进行编辑",
+                tool: .text,
+                showsStylePanel: true
+            )
+            toolButton(
+                "square.grid.3x3.fill",
+                label: "马赛克",
+                help: "在敏感内容上拖动涂抹；二级工具栏调整笔刷粗细",
+                tool: .mosaic,
+                showsStylePanel: true
+            )
+            toolButton(
+                "highlighter",
+                label: "聚光高亮",
+                help: "拖出亮区，截图其余位置会变暗以突出重点",
+                tool: .highlight
+            )
+            actionButton(
+                "rectangle.stack.badge.plus",
+                label: "截长图",
+                help: confirmedSelection?.isWindow == true
+                    ? "自动滚动当前窗口并拼接成长图"
+                    : "请先单击选择一个可滚动窗口，再使用截长图",
+                role: .secondary,
+                isEnabled: confirmedSelection?.isWindow == true
+            ) {
+                confirm(in: bounds, action: .longScreenshot)
+            }
+            actionButton("pin", label: "置顶截图", help: "完成编辑并将截图独立置顶显示", role: .secondary) {
                 confirm(in: bounds, action: .pin)
             }
-            actionButton("xmark", label: "取消截图", role: .secondary) {
+            actionButton("xmark", label: "取消截图", help: "退出本次截图，也可以按 Esc", role: .secondary) {
                 cancel()
             }
-            actionButton("checkmark", label: "确认截图", role: .primary) {
+            actionButton("checkmark", label: "确认截图", help: "完成截图并执行通用设置中的保存或复制动作", role: .primary) {
                 confirm(in: bounds)
             }
         }
         .padding(7)
-        .frame(width: 394, height: 46)
-        .background(FormaTheme.surface)
-        .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .frame(width: 535, height: 46)
+        .background {
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(FormaTheme.surface)
+        }
         .overlay {
             RoundedRectangle(cornerRadius: 11, style: .continuous)
                 .stroke(FormaTheme.lineStrong, lineWidth: 1)
@@ -954,7 +1061,7 @@ private struct FreeSelectionOverlayView: View {
     ) -> ScreenshotToolbarLayout {
         let bounds = rawBounds.standardized
         let selection = validHighlight(rawSelection, in: bounds)
-        let toolbarSize = CGSize(width: 394, height: 46)
+        let toolbarSize = CGSize(width: 535, height: 46)
         let stylePanelSize = annotationStylePanelSize
         let edgeInset: CGFloat = 4
         let outsideGap: CGFloat = 10
@@ -1120,6 +1227,7 @@ private struct FreeSelectionOverlayView: View {
     private func toolButton(
         _ systemImage: String,
         label: String,
+        help: String,
         tool: CaptureOverlayTool,
         showsStylePanel: Bool = false
     ) -> some View {
@@ -1148,13 +1256,16 @@ private struct FreeSelectionOverlayView: View {
         }
         .frame(width: 40)
         .accessibilityLabel(label)
+        .delayedFormaHelp(label, detail: help)
     }
 
     @ViewBuilder
     private func actionButton(
         _ systemImage: String,
         label: String,
+        help: String,
         role: FormaButtonRole,
+        isEnabled: Bool = true,
         action: @escaping () -> Void
     ) -> some View {
         FormaButton(
@@ -1166,13 +1277,20 @@ private struct FreeSelectionOverlayView: View {
             action: action
         )
         .frame(width: 40)
+        .disabled(!isEnabled)
         .accessibilityLabel(label)
+        .delayedFormaHelp(label, detail: help)
     }
 
     private var annotationStylePanelSize: CGSize {
-        expandedStyleTool == .text
-            ? CGSize(width: 294, height: 132)
-            : CGSize(width: 202, height: 84)
+        switch expandedStyleTool {
+        case .text:
+            CGSize(width: 294, height: 132)
+        case .mosaic:
+            CGSize(width: 202, height: 58)
+        default:
+            CGSize(width: 202, height: 84)
+        }
     }
 
     @ViewBuilder
@@ -1188,10 +1306,18 @@ private struct FreeSelectionOverlayView: View {
                             size: .small,
                             segmentWidth: 46
                         )
+                        .delayedFormaHelp(
+                            "文字大小",
+                            detail: "选择小、中、大字号；编辑已有文字时会立即应用"
+                        )
                     }
                     HStack(spacing: 8) {
                         styleLabel("文字")
                         annotationColorPicker(selection: $textColor)
+                            .delayedFormaHelp(
+                                "文字颜色",
+                                detail: "选择文字前景色；再次编辑文字时也可修改"
+                            )
                     }
                     HStack(spacing: 8) {
                         styleLabel("背景")
@@ -1207,6 +1333,10 @@ private struct FreeSelectionOverlayView: View {
                             textBackground = .none
                         }
                         .frame(width: 34)
+                        .delayedFormaHelp(
+                            "无文字背景",
+                            detail: "移除文字后面的色块，只保留文字本身"
+                        )
                         FormaColorSwatchPicker(
                             items: CaptureTextBackground.allCases.compactMap { background in
                                 guard let color = background.swiftUIColor else { return nil }
@@ -1218,7 +1348,25 @@ private struct FreeSelectionOverlayView: View {
                             ),
                             swatchSize: 17
                         )
+                        .delayedFormaHelp(
+                            "文字背景色",
+                            detail: "选择文字后方色块的颜色，提高文字可读性"
+                        )
                     }
+                }
+            } else if expandedStyleTool == .mosaic {
+                HStack(spacing: 8) {
+                    styleLabel("粗细")
+                    FormaCompactRail(
+                        items: CaptureAnnotationThickness.allCases,
+                        selection: $annotationThickness,
+                        size: .small,
+                        segmentWidth: 44
+                    )
+                    .delayedFormaHelp(
+                        "马赛克粗细",
+                        detail: "选择涂抹笔刷的宽度；已有马赛克可拖动调整位置"
+                    )
                 }
             } else {
                 VStack(alignment: .leading, spacing: 8) {
@@ -1228,7 +1376,15 @@ private struct FreeSelectionOverlayView: View {
                         size: .small,
                         segmentWidth: 44
                     )
+                    .delayedFormaHelp(
+                        "标注粗细",
+                        detail: "选择线条的粗细，之后绘制的标注会使用该尺寸"
+                    )
                     annotationColorPicker(selection: $annotationColor)
+                        .delayedFormaHelp(
+                            "标注颜色",
+                            detail: "选择矩形、圆圈、直线或箭头的颜色"
+                        )
                 }
             }
         }
@@ -1281,7 +1437,7 @@ private struct FreeSelectionOverlayView: View {
 
     private func stylePanelX(toolbarX: CGFloat, bounds: CGRect) -> CGFloat {
         let panelHalfWidth = annotationStylePanelSize.width / 2
-        let firstToolCenterOffset: CGFloat = -164.5
+        let firstToolCenterOffset: CGFloat = -235
         let toolStep: CGFloat = 47
         let toolIndex: CGFloat = switch expandedStyleTool {
         case .rectangle: 0
@@ -1289,6 +1445,8 @@ private struct FreeSelectionOverlayView: View {
         case .line: 2
         case .arrow: 3
         case .text: 4
+        case .mosaic: 5
+        case .highlight: 6
         case nil: 0
         }
         let desired = toolbarX + firstToolCenterOffset + toolStep * toolIndex
@@ -1305,7 +1463,37 @@ private struct FreeSelectionOverlayView: View {
             if let annotationDraft { allAnnotations.append(annotationDraft) }
 
             context.clip(to: Path(selection))
+            let highlightAnnotations = allAnnotations.filter { $0.kind == .highlight }
+            if activeTool == .highlight || !highlightAnnotations.isEmpty {
+                context.fill(Path(selection), with: .color(.black.opacity(0.52)))
+                context.blendMode = .destinationOut
+                for annotation in highlightAnnotations {
+                    let rect = normalizedRect(from: annotation.start, to: annotation.end)
+                    context.fill(Path(rect), with: .color(.white))
+                }
+                context.blendMode = .normal
+            }
+
             for annotation in allAnnotations {
+                if annotation.kind == .highlight {
+                    drawAnnotationSelection(
+                        annotation,
+                        bounds: annotationBounds(annotation),
+                        in: &context
+                    )
+                    continue
+                }
+
+                if annotation.kind == .mosaic {
+                    drawMosaicPreview(annotation, in: &context)
+                    drawAnnotationSelection(
+                        annotation,
+                        bounds: annotationBounds(annotation),
+                        in: &context
+                    )
+                    continue
+                }
+
                 if annotation.kind == .text {
                     guard let text = annotation.text, !text.isEmpty else { continue }
                     let fontSize = annotation.textSize?.rawValue
@@ -1387,6 +1575,48 @@ private struct FreeSelectionOverlayView: View {
         .allowsHitTesting(false)
     }
 
+    private func drawMosaicPreview(
+        _ annotation: OverlayAnnotation,
+        in context: inout GraphicsContext
+    ) {
+        let points = annotation.points.isEmpty
+            ? [annotation.start, annotation.end]
+            : annotation.points
+        guard points.count >= 2 else { return }
+
+        let block = max(8, annotation.thickness.mosaicWidth / 2)
+        let radius = annotation.thickness.mosaicWidth / 2
+        for pair in zip(points, points.dropFirst()) {
+            let distance = hypot(pair.1.x - pair.0.x, pair.1.y - pair.0.y)
+            let steps = max(1, Int(ceil(distance / max(3, block * 0.45))))
+            for step in 0...steps {
+                let progress = CGFloat(step) / CGFloat(steps)
+                let center = CGPoint(
+                    x: pair.0.x + (pair.1.x - pair.0.x) * progress,
+                    y: pair.0.y + (pair.1.y - pair.0.y) * progress
+                )
+                let minX = center.x - radius
+                let minY = center.y - radius
+                let rows = max(1, Int(ceil(annotation.thickness.mosaicWidth / block)))
+                for row in 0..<rows {
+                    for column in 0..<rows {
+                        let rect = CGRect(
+                            x: minX + CGFloat(column) * block,
+                            y: minY + CGFloat(row) * block,
+                            width: block + 0.5,
+                            height: block + 0.5
+                        )
+                        let isDark = (row + column + Int(center.x / block) + Int(center.y / block)).isMultiple(of: 2)
+                        context.fill(
+                            Path(rect),
+                            with: .color(isDark ? .black.opacity(0.44) : .white.opacity(0.30))
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     @ViewBuilder
     private func textEditor(at position: CGPoint, selection: CGRect, in bounds: CGRect) -> some View {
         let panelSize = CGSize(width: 256, height: 92)
@@ -1420,6 +1650,7 @@ private struct FreeSelectionOverlayView: View {
                         cancelTextDraft()
                     }
                     .frame(width: 38)
+                    .delayedFormaHelp("取消文字", detail: "放弃本次文字输入", placement: .below)
                     FormaButton(
                         "",
                         systemImage: "checkmark",
@@ -1429,6 +1660,7 @@ private struct FreeSelectionOverlayView: View {
                         commitTextDraft()
                     }
                     .frame(width: 38)
+                    .delayedFormaHelp("确认文字", detail: "完成文字标注并保留在截图上", placement: .below)
                 }
             }
         }
@@ -1548,6 +1780,18 @@ private struct FreeSelectionOverlayView: View {
                 toSegmentFrom: annotation.start,
                 to: annotation.end
             ) <= tolerance
+        case .mosaic:
+            let points = annotation.points.isEmpty
+                ? [annotation.start, annotation.end]
+                : annotation.points
+            return zip(points, points.dropFirst()).contains { pair in
+                distance(from: point, toSegmentFrom: pair.0, to: pair.1)
+                    <= annotation.thickness.mosaicWidth / 2 + 5
+            }
+        case .highlight:
+            return normalizedRect(from: annotation.start, to: annotation.end)
+                .insetBy(dx: -6, dy: -6)
+                .contains(point)
         case .rectangle:
             let rect = normalizedRect(from: annotation.start, to: annotation.end)
             guard rect.insetBy(dx: -tolerance, dy: -tolerance).contains(point) else { return false }
@@ -1585,6 +1829,19 @@ private struct FreeSelectionOverlayView: View {
             )
         }
 
+        if annotation.kind == .mosaic {
+            let points = annotation.points.isEmpty
+                ? [annotation.start, annotation.end]
+                : annotation.points
+            guard let first = points.first else { return .zero }
+            var bounds = CGRect(origin: first, size: .zero)
+            for point in points.dropFirst() {
+                bounds = bounds.union(CGRect(origin: point, size: .zero))
+            }
+            let inset = annotation.thickness.mosaicWidth / 2
+            return bounds.insetBy(dx: -inset, dy: -inset)
+        }
+
         return normalizedRect(from: annotation.start, to: annotation.end)
             .insetBy(dx: -annotation.thickness.rawValue / 2, dy: -annotation.thickness.rawValue / 2)
     }
@@ -1612,6 +1869,11 @@ private struct FreeSelectionOverlayView: View {
         moved.start.y += deltaY
         moved.end.x += deltaX
         moved.end.y += deltaY
+        if !moved.points.isEmpty {
+            moved.points = moved.points.map { point in
+                CGPoint(x: point.x + deltaX, y: point.y + deltaY)
+            }
+        }
         annotations[index] = moved
     }
 
@@ -1812,7 +2074,13 @@ private struct FreeSelectionOverlayView: View {
                 thickness: annotation.thickness,
                 text: annotation.text,
                 textSize: annotation.textSize,
-                textBackground: annotation.textBackground
+                textBackground: annotation.textBackground,
+                points: annotation.points.map { point in
+                    CGPoint(
+                        x: (point.x - frame.minX) / frame.width,
+                        y: (point.y - frame.minY) / frame.height
+                    )
+                }
             )
         }
 

@@ -1,5 +1,6 @@
 import AppKit
 import FormaUI
+import QuartzCore
 import SwiftUI
 
 private final class PinnedScreenshotPanel: NSPanel, NSWindowDelegate {
@@ -16,15 +17,17 @@ private final class PinnedScreenshotPanel: NSPanel, NSWindowDelegate {
     private var logicalZoom: CGFloat = 1
     private var lockedZoomCenter: CGPoint?
     private var lastScrollTimestamp: TimeInterval = 0
-    private var zoomUpdateScheduled = false
+    private var zoomDisplayLink: CADisplayLink?
+    private var needsZoomFrame = false
     private var isApplyingZoomFrame = false
-    private weak var zoomState: PinnedScreenshotZoomState?
+    private var zoomInteractionEndTimer: Timer?
+    private weak var pinnedContentView: PinnedScreenshotContentView?
 
     func configureZoom(
         baseContentSize: CGSize,
         minimumZoom: CGFloat,
         maximumZoom: CGFloat = 4,
-        state: PinnedScreenshotZoomState
+        contentView: PinnedScreenshotContentView
     ) {
         self.baseContentSize = baseContentSize
         self.minimumZoom = minimumZoom
@@ -32,10 +35,16 @@ private final class PinnedScreenshotPanel: NSPanel, NSWindowDelegate {
         logicalZoom = 1
         lockedZoomCenter = CGPoint(x: frame.midX, y: frame.midY)
         lastScrollTimestamp = 0
-        zoomUpdateScheduled = false
+        needsZoomFrame = false
         isApplyingZoomFrame = false
-        zoomState = state
+        pinnedContentView = contentView
         delegate = self
+
+        zoomDisplayLink?.invalidate()
+        let displayLink = displayLink(target: self, selector: #selector(renderZoomFrame(_:)))
+        displayLink.add(to: .main, forMode: .common)
+        displayLink.isPaused = true
+        zoomDisplayLink = displayLink
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -54,10 +63,8 @@ private final class PinnedScreenshotPanel: NSPanel, NSWindowDelegate {
         let isNewGesture = event.phase.contains(.began)
             || event.timestamp - lastScrollTimestamp > 0.18
         if isNewGesture {
-            logicalZoom = min(
-                maximumZoom,
-                max(minimumZoom, frame.width / baseContentSize.width)
-            )
+            let frameZoom = min(maximumZoom, max(minimumZoom, frame.width / baseContentSize.width))
+            logicalZoom = frameZoom
             if lockedZoomCenter == nil {
                 lockedZoomCenter = CGPoint(x: frame.midX, y: frame.midY)
             }
@@ -74,25 +81,43 @@ private final class PinnedScreenshotPanel: NSPanel, NSWindowDelegate {
         }
         let nextZoom = min(maximumZoom, max(minimumZoom, currentZoom * factor))
         guard abs(nextZoom - currentZoom) > 0.0001 else {
-            zoomState?.show(percentage: Int((currentZoom * 100).rounded()))
+            pinnedContentView?.showZoomPercentage(Int((currentZoom * 100).rounded()))
+            scheduleZoomInteractionEnd()
             return
         }
 
         logicalZoom = nextZoom
+        pinnedContentView?.setZoomInteractionActive(true)
+        pinnedContentView?.showZoomPercentage(Int((nextZoom * 100).rounded()))
         scheduleZoomUpdate()
+        scheduleZoomInteractionEnd()
     }
 
     private func scheduleZoomUpdate() {
-        guard !zoomUpdateScheduled else { return }
-        zoomUpdateScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + (1 / 60)) { [weak self] in
-            guard let self else { return }
-            self.zoomUpdateScheduled = false
-            self.applyLogicalZoom()
+        needsZoomFrame = true
+        if let displayLink = zoomDisplayLink {
+            displayLink.isPaused = false
+        } else {
+            applyZoom(logicalZoom)
+            needsZoomFrame = false
         }
     }
 
-    private func applyLogicalZoom() {
+    @objc private func renderZoomFrame(_ displayLink: CADisplayLink) {
+        guard needsZoomFrame else {
+            displayLink.isPaused = true
+            return
+        }
+        needsZoomFrame = false
+        // Trackpads already deliver a smooth stream of precise deltas. Apply
+        // only the newest target once per display refresh instead of creating
+        // a second interpolation loop that keeps resizing the WindowServer
+        // surface after the gesture has moved on.
+        applyZoom(logicalZoom)
+        displayLink.isPaused = true
+    }
+
+    private func applyZoom(_ zoom: CGFloat) {
         guard baseContentSize.width > 0,
               baseContentSize.height > 0 else { return }
 
@@ -102,20 +127,61 @@ private final class PinnedScreenshotPanel: NSPanel, NSWindowDelegate {
             y: currentFrame.midY
         )
         let nextSize = CGSize(
-            width: baseContentSize.width * logicalZoom,
-            height: baseContentSize.height * logicalZoom
+            width: baseContentSize.width * zoom,
+            height: baseContentSize.height * zoom
         )
-        let nextFrame = CGRect(
-            x: center.x - nextSize.width / 2,
-            y: center.y - nextSize.height / 2,
-            width: nextSize.width,
-            height: nextSize.height
-        )
+        let nextFrame = pixelAlignedFrame(center: center, size: nextSize)
+        guard nextFrame != currentFrame else { return }
 
         isApplyingZoomFrame = true
-        setFrame(nextFrame, display: true, animate: false)
+        // The image is layer-backed, so synchronously redrawing the complete
+        // window for every scroll sample only adds main-thread work. AppKit
+        // can commit the new geometry with the next compositor transaction.
+        setFrame(nextFrame, display: false, animate: false)
         isApplyingZoomFrame = false
-        zoomState?.show(percentage: Int((logicalZoom * 100).rounded()))
+    }
+
+    private func scheduleZoomInteractionEnd() {
+        if let timer = zoomInteractionEndTimer, timer.isValid {
+            timer.fireDate = Date(timeIntervalSinceNow: 0.14)
+            return
+        }
+        let timer = Timer(timeInterval: 0.14, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if self.needsZoomFrame {
+                    self.needsZoomFrame = false
+                    self.applyZoom(self.logicalZoom)
+                }
+                self.pinnedContentView?.setZoomInteractionActive(false)
+                self.zoomInteractionEndTimer = nil
+            }
+        }
+        zoomInteractionEndTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func pixelAlignedFrame(center: CGPoint, size: CGSize) -> CGRect {
+        let scale = max(1, backingScaleFactor)
+        let alignedCenter = CGPoint(
+            x: (center.x * scale).rounded() / scale,
+            y: (center.y * scale).rounded() / scale
+        )
+        func evenPixelLength(_ value: CGFloat) -> CGFloat {
+            let pixels = max(2, Int((value * scale).rounded()))
+            let evenPixels = pixels.isMultiple(of: 2) ? pixels : pixels + 1
+            return CGFloat(evenPixels) / scale
+        }
+        let alignedSize = CGSize(
+            width: evenPixelLength(size.width),
+            height: evenPixelLength(size.height)
+        )
+        return CGRect(
+            x: alignedCenter.x - alignedSize.width / 2,
+            y: alignedCenter.y - alignedSize.height / 2,
+            width: alignedSize.width,
+            height: alignedSize.height
+        )
     }
 
     func windowDidMove(_ notification: Notification) {
@@ -124,38 +190,20 @@ private final class PinnedScreenshotPanel: NSPanel, NSWindowDelegate {
     }
 
     func windowDidEndLiveResize(_ notification: Notification) {
-        logicalZoom = min(
+        let resolvedZoom = min(
             maximumZoom,
             max(minimumZoom, frame.width / max(1, baseContentSize.width))
         )
+        logicalZoom = resolvedZoom
         lockedZoomCenter = CGPoint(x: frame.midX, y: frame.midY)
     }
-}
 
-@MainActor
-private final class PinnedScreenshotZoomState: ObservableObject {
-    @Published private(set) var visiblePercentage: Int?
-    private var hideTask: Task<Void, Never>?
-
-    func show(percentage: Int) {
-        hideTask?.cancel()
-        if visiblePercentage != percentage {
-            visiblePercentage = percentage
-        }
-        hideTask = Task { @MainActor in
-            do {
-                try await Task.sleep(for: .milliseconds(850))
-            } catch {
-                return
-            }
-            guard !Task.isCancelled else { return }
-            visiblePercentage = nil
-            hideTask = nil
-        }
-    }
-
-    deinit {
-        hideTask?.cancel()
+    override func close() {
+        zoomInteractionEndTimer?.invalidate()
+        zoomInteractionEndTimer = nil
+        zoomDisplayLink?.invalidate()
+        zoomDisplayLink = nil
+        super.close()
     }
 }
 
@@ -195,6 +243,8 @@ final class PinnedScreenshotController {
             defer: false
         )
         panel.identifier = NSUserInterfaceItemIdentifier(Self.windowIdentifierPrefix + id.uuidString)
+        panel.title = "M · Imago 置顶截图"
+        panel.isExcludedFromWindowsMenu = true
         panel.level = .floating
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
@@ -203,6 +253,7 @@ final class PinnedScreenshotController {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.isMovableByWindowBackground = true
+        panel.preservesContentDuringLiveResize = true
         panel.contentMinSize = minimumSize
         panel.collectionBehavior = [
             .canJoinAllSpaces,
@@ -210,17 +261,13 @@ final class PinnedScreenshotController {
             .stationary,
             .ignoresCycle
         ]
-        let zoomState = PinnedScreenshotZoomState()
-        let hostingView = NSHostingView(
-            rootView: FormaUIRoot(soundCenter: ApplicationPreferences.shared.soundCenter) {
-                PinnedScreenshotView(image: image, zoomState: zoomState) { [weak self] in
-                    self?.dismiss(id: id)
-                }
-            }
-        )
-        hostingView.frame = CGRect(origin: .zero, size: fitted)
-        hostingView.autoresizingMask = [.width, .height]
-        panel.contentView = hostingView
+        let contentView = PinnedScreenshotContentView(
+            image: image,
+            size: fitted
+        ) { [weak self] in
+            self?.dismiss(id: id)
+        }
+        panel.contentView = contentView
         panel.setContentSize(fitted)
         let minimumZoom = max(
             0.25,
@@ -230,7 +277,7 @@ final class PinnedScreenshotController {
         panel.configureZoom(
             baseContentSize: fitted,
             minimumZoom: minimumZoom,
-            state: zoomState
+            contentView: contentView
         )
         panels[id] = panel
         panel.orderFrontRegardless()
@@ -253,38 +300,167 @@ final class PinnedScreenshotController {
     }
 }
 
-private struct PinnedScreenshotView: View {
-    let image: CGImage
-    @ObservedObject var zoomState: PinnedScreenshotZoomState
+private final class PinnedScreenshotContentView: NSView {
+    private static let controlsSize = CGSize(width: 220, height: 74)
+
+    private let backgroundLayer = CALayer()
+    private let imageLayer = CALayer()
+    private let borderLayer = CALayer()
+    private let zoomBadgeLayer = CALayer()
+    private let zoomTextLayer = CATextLayer()
+    private let hostingView: NSHostingView<AnyView>
+    private var zoomBadgeHideTimer: Timer?
+
+    init(
+        image: CGImage,
+        size: CGSize,
+        onClose: @escaping () -> Void
+    ) {
+        hostingView = NSHostingView(rootView: AnyView(EmptyView()))
+        super.init(frame: CGRect(origin: .zero, size: size))
+
+        wantsLayer = true
+        setAccessibilityLabel("置顶截图")
+        layer?.masksToBounds = true
+        layer?.cornerRadius = 12
+        layer?.drawsAsynchronously = true
+        layerContentsRedrawPolicy = .onSetNeedsDisplay
+
+        backgroundLayer.backgroundColor = NSColor.black.cgColor
+        imageLayer.contents = image
+        imageLayer.contentsGravity = .resizeAspect
+        imageLayer.minificationFilter = .linear
+        imageLayer.magnificationFilter = .linear
+        imageLayer.drawsAsynchronously = true
+        borderLayer.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
+        borderLayer.borderWidth = 1
+        borderLayer.cornerRadius = 12
+        zoomBadgeLayer.backgroundColor = NSColor.black.withAlphaComponent(0.72).cgColor
+        zoomBadgeLayer.cornerRadius = 15
+        zoomBadgeLayer.opacity = 0
+        zoomTextLayer.alignmentMode = .center
+        zoomTextLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+
+        layer?.addSublayer(backgroundLayer)
+        layer?.addSublayer(imageLayer)
+        layer?.addSublayer(borderLayer)
+        layer?.addSublayer(zoomBadgeLayer)
+        zoomBadgeLayer.addSublayer(zoomTextLayer)
+
+        hostingView.rootView = AnyView(
+            FormaUIRoot(soundCenter: ApplicationPreferences.shared.soundCenter) {
+                PinnedScreenshotControlsView(
+                    onOpacityChange: { [weak self] opacity in
+                        self?.setImageOpacity(opacity)
+                    },
+                    onClose: onClose
+                )
+            }
+        )
+        hostingView.frame = CGRect(
+            x: max(0, size.width - Self.controlsSize.width),
+            y: max(0, size.height - Self.controlsSize.height),
+            width: Self.controlsSize.width,
+            height: Self.controlsSize.height
+        )
+        hostingView.wantsLayer = true
+        hostingView.layer?.backgroundColor = NSColor.clear.cgColor
+        hostingView.layerContentsRedrawPolicy = .onSetNeedsDisplay
+        addSubview(hostingView)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        backgroundLayer.frame = bounds
+        imageLayer.frame = bounds
+        borderLayer.frame = bounds.insetBy(dx: 0.5, dy: 0.5)
+        zoomBadgeLayer.frame = CGRect(
+            x: bounds.midX - 36,
+            y: bounds.midY - 15,
+            width: 72,
+            height: 30
+        )
+        zoomTextLayer.frame = CGRect(x: 0, y: 6, width: 72, height: 18)
+        hostingView.frame.origin = CGPoint(
+            x: max(0, bounds.width - Self.controlsSize.width),
+            y: max(0, bounds.height - Self.controlsSize.height)
+        )
+        CATransaction.commit()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        imageLayer.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        zoomTextLayer.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+    }
+
+    func setZoomInteractionActive(_ isActive: Bool) {
+        hostingView.layer?.shouldRasterize = isActive
+        hostingView.layer?.rasterizationScale = window?.backingScaleFactor
+            ?? NSScreen.main?.backingScaleFactor
+            ?? 2
+    }
+
+    func showZoomPercentage(_ percentage: Int) {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        zoomTextLayer.string = NSAttributedString(
+            string: "\(percentage)%",
+            attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .bold),
+                .foregroundColor: NSColor.white,
+                .paragraphStyle: paragraph
+            ]
+        )
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        zoomBadgeLayer.opacity = 1
+        CATransaction.commit()
+
+        if let timer = zoomBadgeHideTimer, timer.isValid {
+            timer.fireDate = Date(timeIntervalSinceNow: 0.85)
+            return
+        }
+        let timer = Timer(timeInterval: 0.85, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                CATransaction.begin()
+                CATransaction.setAnimationDuration(0.12)
+                self.zoomBadgeLayer.opacity = 0
+                CATransaction.commit()
+                self.zoomBadgeHideTimer = nil
+            }
+        }
+        zoomBadgeHideTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func setImageOpacity(_ opacity: Double) {
+        let resolved = Float(min(1, max(0.15, opacity)))
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.12)
+        backgroundLayer.opacity = resolved
+        imageLayer.opacity = resolved
+        borderLayer.opacity = resolved
+        CATransaction.commit()
+    }
+
+}
+
+private struct PinnedScreenshotControlsView: View {
+    let onOpacityChange: (Double) -> Void
     let onClose: () -> Void
     @State private var screenshotOpacity = 1.0
 
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(FormaTheme.ink)
-                .opacity(screenshotOpacity)
-
-            Image(nsImage: NSImage(cgImage: image, size: .zero))
-                .resizable()
-                .scaledToFit()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .opacity(screenshotOpacity)
-
-            if let percentage = zoomState.visiblePercentage {
-                Text("\(percentage)%")
-                    .font(.system(size: 14, weight: .bold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 7)
-                    .background(.black.opacity(0.72))
-                    .clipShape(Capsule())
-                    .shadow(color: .black.opacity(0.28), radius: 5, y: 2)
-                    .transition(.opacity.combined(with: .scale(scale: 0.92)))
-                    .allowsHitTesting(false)
-            }
-
             VStack {
                 HStack(spacing: 8) {
                     Spacer()
@@ -298,45 +474,40 @@ private struct PinnedScreenshotView: View {
                         action: onClose
                     )
                     .frame(width: 38)
-                    .padding(8)
                     .accessibilityLabel("关闭置顶截图")
-                    .formaTooltip("关闭置顶截图")
+                    .delayedFormaHelp(
+                        "关闭置顶截图",
+                        detail: "关闭当前这张置顶图片",
+                        placement: .below
+                    )
                 }
+                .padding(8)
                 Spacer()
             }
         }
-        .animation(.easeOut(duration: 0.14), value: zoomState.visiblePercentage)
         .background(Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(FormaTheme.lineStrong.opacity(0.72 * screenshotOpacity), lineWidth: 1)
+        .onAppear { onOpacityChange(screenshotOpacity) }
+        .onChange(of: screenshotOpacity) { _, opacity in
+            onOpacityChange(opacity)
         }
     }
 
     private var opacityControl: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "circle.lefthalf.filled")
-                .font(.system(size: 11, weight: .bold))
-                .foregroundStyle(.white.opacity(0.9))
-
-            Slider(value: $screenshotOpacity, in: 0.15...1, step: 0.05)
-                .tint(FormaTheme.accent)
-                .frame(minWidth: 42, idealWidth: 76, maxWidth: 92)
-                .accessibilityLabel("置顶截图透明度")
-                .accessibilityValue("\(Int((screenshotOpacity * 100).rounded()))%")
-
-            Text("\(Int((screenshotOpacity * 100).rounded()))%")
-                .font(.system(size: 10, weight: .bold, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(.white)
-                .frame(width: 32, alignment: .trailing)
+        FormaFloatingCard(padding: 8) {
+            FormaSlider(
+                "透明度",
+                value: $screenshotOpacity,
+                range: 0.15...1,
+                step: 0.05,
+                formatter: { "\(Int(($0 * 100).rounded()))%" }
+            )
+            .frame(width: 142)
         }
-        .padding(.horizontal, 9)
-        .frame(height: 30)
-        .background(.black.opacity(0.72))
-        .clipShape(Capsule())
-        .shadow(color: .black.opacity(0.24), radius: 4, y: 2)
-        .accessibilityElement(children: .contain)
+        .frame(width: 158, height: 58)
+        .delayedFormaHelp(
+            "透明度",
+            detail: "拖动滑条调整截图透明度，控制按钮保持清晰",
+            placement: .below
+        )
     }
 }
