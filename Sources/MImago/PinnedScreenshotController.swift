@@ -252,7 +252,7 @@ final class PinnedScreenshotController {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        panel.isMovableByWindowBackground = true
+        panel.isMovableByWindowBackground = false
         panel.preservesContentDuringLiveResize = true
         panel.contentMinSize = minimumSize
         panel.collectionBehavior = [
@@ -300,6 +300,14 @@ final class PinnedScreenshotController {
     }
 }
 
+private final class PinnedScreenshotControlsHostingView: NSHostingView<AnyView> {
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+}
+
 private final class PinnedScreenshotContentView: NSView {
     private static let controlsSize = CGSize(width: 204, height: 62)
 
@@ -308,7 +316,7 @@ private final class PinnedScreenshotContentView: NSView {
     private let borderLayer = CALayer()
     private let zoomBadgeLayer = CALayer()
     private let zoomTextLayer = CATextLayer()
-    private let hostingView: NSHostingView<AnyView>
+    private let hostingView: PinnedScreenshotControlsHostingView
     private var zoomBadgeHideTimer: Timer?
 
     init(
@@ -316,7 +324,7 @@ private final class PinnedScreenshotContentView: NSView {
         size: CGSize,
         onClose: @escaping () -> Void
     ) {
-        hostingView = NSHostingView(rootView: AnyView(EmptyView()))
+        hostingView = PinnedScreenshotControlsHostingView(rootView: AnyView(EmptyView()))
         super.init(frame: CGRect(origin: .zero, size: size))
 
         wantsLayer = true
@@ -372,6 +380,19 @@ private final class PinnedScreenshotContentView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard !hostingView.frame.contains(point), let window else {
+            super.mouseDown(with: event)
+            return
+        }
+        window.performDrag(with: event)
     }
 
     override func layout() {
