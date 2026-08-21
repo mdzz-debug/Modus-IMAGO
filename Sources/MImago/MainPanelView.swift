@@ -760,145 +760,27 @@ private struct StorageSettings: View {
 }
 
 private struct FeedbackSettings: View {
-    @StateObject private var controller = FeedbackController()
-    @State private var isPresented = false
-    @State private var description = ""
-    @State private var contact = ""
-    @State private var includesDiagnostics = true
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            FormaCard(
-                title: "问题反馈",
-                subtitle: "反馈时可自动附带诊断信息；当前版本仅提供交互预览",
+        FormaCard(
+            title: "问题反馈",
+            subtitle: "反馈时可自动附带诊断信息；当前版本仅提供交互预览",
+            size: .small
+        ) {
+            FormaFormRow(
+                "反馈与诊断",
+                detail: "在独立打印窗口中填写和预览反馈",
                 size: .small
             ) {
-                FormaFormRow(
-                    "反馈与诊断",
-                    detail: "内部日志默认静默记录，不包含截图或录屏内容",
+                FormaButton(
+                    "提交反馈",
+                    systemImage: "printer.fill",
+                    role: .secondary,
                     size: .small
                 ) {
-                    FormaButton(
-                        isPresented ? "收起反馈" : "提交反馈",
-                        systemImage: isPresented ? "chevron.up" : "printer.fill",
-                        role: .secondary,
-                        size: .small,
-                        depth: .raised
-                    ) {
-                        if isPresented {
-                            controller.reset()
-                        }
-                        isPresented.toggle()
-                    }
+                    FeedbackPrinterWindowController.shared.show()
                 }
-            }
-
-            if isPresented {
-                FormaCard(
-                    title: "反馈打印台",
-                    subtitle: "打印机动画会模拟附带日志并发送，但不会连接网络",
-                    size: .small
-                ) {
-                VStack(alignment: .leading, spacing: 12) {
-                    FormaTextArea(
-                        "问题描述",
-                        text: $description,
-                        characterLimit: 800,
-                        size: .small
-                    )
-
-                    FormaTextField(
-                        "联系方式（可选）",
-                        text: $contact,
-                        placeholder: "邮箱或其他联系方式",
-                        size: .small
-                    )
-
-                    FormaSwitch(
-                        "附带诊断日志",
-                        detail: "包含版本、系统、显示器信息和应用运行日志",
-                        onSystemImage: "doc.text.fill",
-                        offSystemImage: "doc.text",
-                        isOn: $includesDiagnostics,
-                        size: .small
-                    )
-
-                    FormaPaperFeedView(
-                        progress: controller.printProgress,
-                        isActive: controller.isSending,
-                        style: .receipt,
-                        paperInset: 10
-                    ) {
-                        feedbackPaper
-                    }
-                    .frame(height: 132)
-
-                    if let resultMessage = controller.resultMessage {
-                        FormaInlineMessage(
-                            controller.resultIsError ? "反馈未提交" : "模拟发送完成",
-                            detail: resultMessage,
-                            tone: controller.resultIsError ? .error : .success
-                        )
-                    }
-
-                    HStack(spacing: 10) {
-                        FormaButton("收起", role: .secondary, size: .small) {
-                            controller.reset()
-                            isPresented = false
-                        }
-                        FormaButton(
-                            "导出报告",
-                            systemImage: "square.and.arrow.down",
-                            role: .secondary,
-                            size: .small
-                        ) {
-                            controller.exportReport(
-                                description: description,
-                                contact: contact,
-                                includesDiagnostics: includesDiagnostics
-                            )
-                        }
-                        FormaButton(
-                            "打印并发送",
-                            systemImage: "printer.fill",
-                            size: .small,
-                            isLoading: controller.isSending
-                        ) {
-                            controller.simulateSend(
-                                description: description,
-                                contact: contact,
-                                includesDiagnostics: includesDiagnostics
-                            )
-                        }
-                    }
-                }
-                }
-                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
-        .animation(.easeOut(duration: 0.18), value: isPresented)
-    }
-
-    private var feedbackPaper: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack {
-                Text("M · IMAGO / FEEDBACK")
-                    .font(.formaLabel(9))
-                    .tracking(1)
-                Spacer()
-                FormaBadge(includesDiagnostics ? "LOG ON" : "LOG OFF", tone: .info, size: .small)
-            }
-            Text(description.isEmpty ? "请填写问题描述…" : description)
-                .font(.formaBody(10, weight: .medium))
-                .foregroundStyle(description.isEmpty ? FormaTheme.inkSoft : FormaTheme.ink)
-                .lineLimit(3)
-            Spacer(minLength: 0)
-            Text("NETWORK TRANSMISSION: SIMULATION ONLY")
-                .font(.formaLabel(7))
-                .foregroundStyle(FormaTheme.inkSoft)
-        }
-        .padding(12)
-        .frame(height: 108)
     }
 }
 
