@@ -23,6 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Self.shared = self
+        FreeSelectionOverlay.restoreDockMagnificationIfNeeded()
         DiagnosticLogStore.shared.start()
         _ = ShortcutSettingsStore.shared
         let launchedAtLogin = NSAppleEventManager.shared().currentAppleEvent?
@@ -120,6 +121,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldSaveSecureApplicationState(_ app: NSApplication) -> Bool {
         false
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        FreeSelectionOverlay.restoreDockMagnificationIfNeeded()
     }
 
     func applicationShouldRestoreSecureApplicationState(_ app: NSApplication) -> Bool {

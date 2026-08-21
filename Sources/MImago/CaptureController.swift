@@ -5,6 +5,7 @@ import CoreText
 import FormaUI
 import Foundation
 import ScreenCaptureKit
+import VideoToolbox
 
 @MainActor
 final class MImagoPermissions {
@@ -119,9 +120,281 @@ final class MImagoPermissions {
     }
 }
 
+private struct LongScreenshotFrameUpdate: @unchecked Sendable {
+    let previewImage: CGImage?
+    let frameCount: Int
+    let shift: Int
+}
+
+private final class LongScreenshotFrameProcessor: @unchecked Sendable {
+    private let lock = NSLock()
+    private var firstFrame: CGImage?
+    private var lastFrame: CGImage?
+    private var appendedStrips: [CGImage] = []
+    private var totalHeight = 0
+    private var lastPreviewUptime = 0.0
+    private var hasPendingPreview = false
+
+    var hasFrames: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return firstFrame != nil
+    }
+
+    func consume(_ captured: CGImage) throws -> LongScreenshotFrameUpdate? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let previous = lastFrame else {
+            firstFrame = captured
+            lastFrame = captured
+            totalHeight = captured.height
+            lastPreviewUptime = ProcessInfo.processInfo.systemUptime
+            return LongScreenshotFrameUpdate(
+                previewImage: captured,
+                frameCount: 1,
+                shift: 0
+            )
+        }
+
+        let shift = try CaptureController.detectedVerticalShift(
+            from: previous,
+            to: captured
+        )
+        if shift >= 2 {
+            let stripHeight = min(shift, captured.height)
+            guard let strip = CaptureController.copiedRegion(
+                CGRect(
+                    x: 0,
+                    y: captured.height - stripHeight,
+                    width: captured.width,
+                    height: stripHeight
+                ),
+                from: captured
+            ) else { return nil }
+            guard totalHeight + strip.height <= 60_000 else {
+                throw CaptureError.longScreenshotTooLarge
+            }
+            appendedStrips.append(strip)
+            totalHeight += strip.height
+            lastFrame = captured
+            hasPendingPreview = true
+        }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        let previewImage: CGImage?
+        if hasPendingPreview,
+           now - lastPreviewUptime >= 0.24,
+           let firstFrame {
+            previewImage = try CaptureController.stitchVerticalSegments(
+                first: firstFrame,
+                strips: appendedStrips,
+                maximumPixelSize: CGSize(width: 440, height: 1_400)
+            )
+            hasPendingPreview = false
+            lastPreviewUptime = now
+        } else {
+            previewImage = nil
+        }
+        guard shift >= 2 || previewImage != nil else { return nil }
+        return LongScreenshotFrameUpdate(
+            previewImage: previewImage,
+            frameCount: appendedStrips.count + 1,
+            shift: shift
+        )
+    }
+
+    func finishedImage() -> CGImage? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let firstFrame else { return nil }
+        return try? CaptureController.stitchVerticalSegments(
+            first: firstFrame,
+            strips: appendedStrips
+        )
+    }
+}
+
 @MainActor
 final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCRecordingOutputDelegate {
     static let shared = CaptureController()
+
+    enum ManualLongScreenshotSource: Sendable {
+        case window(windowID: CGWindowID, processID: pid_t)
+        case region(displayID: CGDirectDisplayID, normalizedRect: CGRect)
+    }
+
+    @MainActor
+    final class ManualLongScreenshotSession: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegate {
+        @Published private(set) var previewImage: CGImage?
+        @Published private(set) var capturedFrameCount = 0
+        @Published private(set) var isCapturing = false
+        @Published private(set) var errorMessage: String?
+
+        private let source: ManualLongScreenshotSource
+        private let frameQueue = DispatchQueue(
+            label: "com.modus-imago.long-screenshot.frames",
+            qos: .userInitiated
+        )
+        private nonisolated let frameProcessor = LongScreenshotFrameProcessor()
+        private var stream: SCStream?
+        private var isStopped = false
+
+        init(source: ManualLongScreenshotSource) {
+            self.source = source
+        }
+
+        func start() {
+            guard !frameProcessor.hasFrames, stream == nil, !isCapturing else { return }
+            isCapturing = true
+            errorMessage = nil
+            DiagnosticLogStore.shared.log(
+                .info,
+                category: "long-screenshot",
+                "manual-session-start source=\(sourceDescription)"
+            )
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    let (filter, configuration) = try await CaptureController.longScreenshotStreamConfiguration(
+                        source: source
+                    )
+                    guard !isStopped else { return }
+
+                    let stream = SCStream(
+                        filter: filter,
+                        configuration: configuration,
+                        delegate: self
+                    )
+                    try stream.addStreamOutput(
+                        self,
+                        type: .screen,
+                        sampleHandlerQueue: frameQueue
+                    )
+                    self.stream = stream
+                    try await stream.startCapture()
+                    guard !isStopped else {
+                        try? await stream.stopCapture()
+                        return
+                    }
+                    DiagnosticLogStore.shared.log(
+                        .info,
+                        category: "long-screenshot",
+                        "manual-frame-stream-ready source=\(sourceDescription)"
+                    )
+                } catch {
+                    errorMessage = error.localizedDescription
+                    DiagnosticLogStore.shared.log(
+                        .error,
+                        category: "long-screenshot",
+                        "manual-session-start-failed error=\(error.localizedDescription)"
+                    )
+                }
+                isCapturing = false
+            }
+        }
+
+        func stop() {
+            isStopped = true
+            isCapturing = false
+            let activeStream = stream
+            stream = nil
+            if let activeStream {
+                Task { try? await activeStream.stopCapture() }
+            }
+            DiagnosticLogStore.shared.log(
+                .debug,
+                category: "long-screenshot",
+                "manual-session-stop frames=\(capturedFrameCount)"
+            )
+        }
+
+        func finishedImage() -> CGImage? {
+            frameProcessor.finishedImage()
+        }
+
+        nonisolated func stream(
+            _ stream: SCStream,
+            didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+            of type: SCStreamOutputType
+        ) {
+            guard type == .screen,
+                  sampleBuffer.isValid,
+                  sampleBuffer.dataReadiness == .ready,
+                  let attachments = CMSampleBufferGetSampleAttachmentsArray(
+                    sampleBuffer,
+                    createIfNecessary: false
+                  ) as? [[SCStreamFrameInfo: Any]],
+                  let statusValue = attachments.first?[.status] as? Int,
+                  SCFrameStatus(rawValue: statusValue) == .complete,
+                  let pixelBuffer = sampleBuffer.imageBuffer else { return }
+
+            var image: CGImage?
+            guard VTCreateCGImageFromCVPixelBuffer(
+                pixelBuffer,
+                options: nil,
+                imageOut: &image
+            ) == noErr,
+                  let image else { return }
+
+            do {
+                guard let update = try frameProcessor.consume(image) else { return }
+                Task { @MainActor [weak self] in
+                    self?.apply(update)
+                }
+            } catch {
+                Task { @MainActor [weak self] in
+                    self?.reportFrameError(error)
+                }
+            }
+        }
+
+        nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
+            Task { @MainActor [weak self] in
+                guard let self, !isStopped else { return }
+                isCapturing = false
+                errorMessage = error.localizedDescription
+                DiagnosticLogStore.shared.log(
+                    .warning,
+                    category: "long-screenshot",
+                    "manual-frame-stream-stopped error=\(error.localizedDescription)"
+                )
+            }
+        }
+
+        private func apply(_ update: LongScreenshotFrameUpdate) {
+            guard !isStopped else { return }
+            capturedFrameCount = update.frameCount
+            if let updatedPreview = update.previewImage {
+                previewImage = updatedPreview
+            }
+            errorMessage = nil
+            DiagnosticLogStore.shared.log(
+                .debug,
+                category: "long-screenshot",
+                "manual-frame-captured count=\(update.frameCount) shift=\(update.shift) preview-height=\(update.previewImage?.height ?? previewImage?.height ?? 0)"
+            )
+        }
+
+        private func reportFrameError(_ error: Error) {
+            guard !isStopped else { return }
+            errorMessage = error.localizedDescription
+            DiagnosticLogStore.shared.log(
+                .warning,
+                category: "long-screenshot",
+                "manual-frame-failed error=\(error.localizedDescription)"
+            )
+        }
+
+        private var sourceDescription: String {
+            switch source {
+            case let .window(windowID, processID):
+                "window=\(windowID) pid=\(processID)"
+            case let .region(displayID, normalizedRect):
+                "region display=\(displayID) rect=\(normalizedRect.debugDescription)"
+            }
+        }
+    }
 
     @Published private(set) var isCapturing = false
     @Published private(set) var isRecording = false
@@ -224,6 +497,20 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         }
     }
 
+    func finishManualLongScreenshot(_ image: CGImage) {
+        statusMessage = "正在完成长截图…"
+        do {
+            try finishScreenshot(
+                image,
+                completion: CapturePreferences.shared.screenshotCompletion
+            )
+            statusMessage = "长截图已完成"
+        } catch {
+            statusMessage = Self.captureFailureMessage(prefix: "长截图失败", error: error)
+        }
+        restoreWindowsHiddenForCapture()
+    }
+
     private func beginFreeScreenshot(initialPointerGlobalLocation: CGPoint) {
         guard !isSelectionOverlayPresented else {
             DiagnosticLogStore.shared.log(
@@ -264,6 +551,9 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         ) { result in
             CaptureController.shared.isSelectionOverlayPresented = false
             CaptureController.shared.takeFreeScreenshot(result)
+        } onLongScreenshot: { image in
+            CaptureController.shared.isSelectionOverlayPresented = false
+            CaptureController.shared.finishManualLongScreenshot(image)
         } onCancel: {
             CaptureController.shared.cancelFreeScreenshot()
         }
@@ -570,7 +860,8 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
 
     nonisolated private static func captureDisplayRegionImage(
         displayID: CGDirectDisplayID,
-        normalizedRect: CGRect
+        normalizedRect: CGRect,
+        excludingCurrentProcess: Bool = false
     ) async throws -> CGImage {
         let content = try await SCShareableContent.excludingDesktopWindows(
             false,
@@ -597,11 +888,97 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         // video encoder helper does.
         configuration.width = max(1, Int((sourceRect.width * scale).rounded()))
         configuration.height = max(1, Int((sourceRect.height * scale).rounded()))
-        configuration.showsCursor = true
+        configuration.showsCursor = !excludingCurrentProcess
+        let filter: SCContentFilter
+        if excludingCurrentProcess,
+           let application = content.applications.first(where: {
+               $0.processID == ProcessInfo.processInfo.processIdentifier
+           }) {
+            filter = SCContentFilter(
+                display: display,
+                excludingApplications: [application],
+                exceptingWindows: []
+            )
+        } else {
+            filter = SCContentFilter(display: display, excludingWindows: [])
+        }
         return try await SCScreenshotManager.captureImage(
-            contentFilter: SCContentFilter(display: display, excludingWindows: []),
+            contentFilter: filter,
             configuration: configuration
         )
+    }
+
+    nonisolated private static func longScreenshotStreamConfiguration(
+        source: ManualLongScreenshotSource
+    ) async throws -> (SCContentFilter, SCStreamConfiguration) {
+        let content = try await SCShareableContent.excludingDesktopWindows(
+            false,
+            onScreenWindowsOnly: true
+        )
+        let configuration = SCStreamConfiguration()
+        let filter: SCContentFilter
+
+        switch source {
+        case let .window(windowID, processID):
+            guard let window = content.windows.first(where: {
+                $0.windowID == windowID &&
+                $0.owningApplication?.processID == processID
+            }) else {
+                throw CaptureError.windowUnavailable
+            }
+            let sourceScale = content.displays
+                .filter { $0.frame.intersects(window.frame) }
+                .max { lhs, rhs in
+                    lhs.frame.intersection(window.frame).area
+                        < rhs.frame.intersection(window.frame).area
+                }
+                .map { CGFloat($0.width) / max(1, $0.frame.width) }
+                ?? 1
+            configuration.width = max(1, Int((window.frame.width * sourceScale).rounded()))
+            configuration.height = max(1, Int((window.frame.height * sourceScale).rounded()))
+            configuration.ignoreShadowsSingleWindow = true
+            filter = SCContentFilter(desktopIndependentWindow: window)
+
+        case let .region(displayID, normalizedRect):
+            guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
+                throw CaptureError.noDisplayAvailable
+            }
+            let clamped = normalizedRect.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+            guard clamped.width > 0, clamped.height > 0 else {
+                throw CaptureError.invalidSelection
+            }
+            let sourceRect = CGRect(
+                x: clamped.minX * display.frame.width,
+                y: clamped.minY * display.frame.height,
+                width: clamped.width * display.frame.width,
+                height: clamped.height * display.frame.height
+            )
+            let scale = CGFloat(display.width) / max(1, display.frame.width)
+            configuration.sourceRect = sourceRect
+            configuration.width = max(1, Int((sourceRect.width * scale).rounded()))
+            configuration.height = max(1, Int((sourceRect.height * scale).rounded()))
+            if let ownApplication = content.applications.first(where: {
+                $0.processID == ProcessInfo.processInfo.processIdentifier
+            }) {
+                filter = SCContentFilter(
+                    display: display,
+                    excludingApplications: [ownApplication],
+                    exceptingWindows: []
+                )
+            } else {
+                filter = SCContentFilter(display: display, excludingWindows: [])
+            }
+        }
+
+        configuration.scalesToFit = true
+        configuration.preservesAspectRatio = true
+        configuration.captureResolution = .best
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 6)
+        configuration.queueDepth = 2
+        configuration.pixelFormat = kCVPixelFormatType_32BGRA
+        configuration.showsCursor = false
+        configuration.capturesAudio = false
+        return (filter, configuration)
     }
 
     private static func windowCandidates(for screen: NSScreen) -> [CaptureWindowCandidate] {
@@ -942,6 +1319,50 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         return best
     }
 
+    private static func largestScrollableFrame(in root: AXUIElement) -> CGRect? {
+        var best: CGRect?
+
+        func visit(_ element: AXUIElement, depth: Int) {
+            guard depth < 18 else { return }
+
+            var rawRole: CFTypeRef?
+            let role = AXUIElementCopyAttributeValue(
+                element,
+                kAXRoleAttribute as CFString,
+                &rawRole
+            ) == .success ? rawRole as? String : nil
+
+            var rawScrollBar: CFTypeRef?
+            let hasVerticalScrollBar = AXUIElementCopyAttributeValue(
+                element,
+                kAXVerticalScrollBarAttribute as CFString,
+                &rawScrollBar
+            ) == .success
+            if role == kAXScrollAreaRole || hasVerticalScrollBar {
+                let frame = axWindowFrame(element)
+                if frame.width >= 120,
+                   frame.height >= 120,
+                   frame.area > (best?.area ?? 0) {
+                    best = frame
+                }
+            }
+
+            var rawChildren: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(
+                element,
+                kAXChildrenAttribute as CFString,
+                &rawChildren
+            ) == .success,
+                  let children = rawChildren as? [AXUIElement] else { return }
+            for child in children {
+                visit(child, depth: depth + 1)
+            }
+        }
+
+        visit(root, depth: 0)
+        return best
+    }
+
     private static func accessibilityNumber(
         _ element: AXUIElement,
         attribute: String
@@ -982,36 +1403,68 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         _ frames: [CGImage]
     ) throws -> CGImage {
         guard let first = frames.first else { throw CaptureError.imageUnavailable }
-        var strips: [(image: CGImage, height: Int)] = []
+        var strips: [CGImage] = []
         var previous = first
 
         for next in frames.dropFirst() {
             let shift = try detectedVerticalShift(from: previous, to: next)
             guard shift >= 2 else { continue }
             let stripHeight = min(shift, next.height)
-            guard let strip = next.cropping(
-                to: CGRect(x: 0, y: 0, width: next.width, height: stripHeight)
+            guard let strip = copiedRegion(
+                CGRect(
+                    x: 0,
+                    y: next.height - stripHeight,
+                    width: next.width,
+                    height: stripHeight
+                ),
+                from: next
             ) else { continue }
-            strips.append((strip, stripHeight))
+            strips.append(strip)
             previous = next
         }
 
         guard !strips.isEmpty else { throw CaptureError.longScreenshotNoMovement }
+        return try stitchVerticalSegments(first: first, strips: strips)
+    }
+
+    nonisolated fileprivate static func stitchVerticalSegments(
+        first: CGImage,
+        strips: [CGImage],
+        maximumPixelSize: CGSize? = nil
+    ) throws -> CGImage {
         let totalHeight = first.height + strips.reduce(0) { $0 + $1.height }
         guard totalHeight <= 60_000,
-              let context = CGContext(
+              first.width > 0,
+              totalHeight > 0 else {
+            throw CaptureError.longScreenshotTooLarge
+        }
+
+        let scale: CGFloat
+        if let maximumPixelSize {
+            scale = min(
+                1,
+                maximumPixelSize.width / CGFloat(first.width),
+                maximumPixelSize.height / CGFloat(totalHeight)
+            )
+        } else {
+            scale = 1
+        }
+        let outputWidth = max(1, Int((CGFloat(first.width) * scale).rounded()))
+        let outputHeight = max(1, Int((CGFloat(totalHeight) * scale).rounded()))
+        guard let context = CGContext(
                 data: nil,
-                width: first.width,
-                height: totalHeight,
+                width: outputWidth,
+                height: outputHeight,
                 bitsPerComponent: 8,
                 bytesPerRow: 0,
                 space: CGColorSpaceCreateDeviceRGB(),
                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
               ) else {
-            throw CaptureError.longScreenshotTooLarge
+            throw CaptureError.imageEncodingFailed
         }
 
-        context.interpolationQuality = .high
+        context.interpolationQuality = scale < 1 ? .medium : .high
+        context.scaleBy(x: scale, y: scale)
         var cursorY = totalHeight - first.height
         context.draw(
             first,
@@ -1020,7 +1473,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         for strip in strips {
             cursorY -= strip.height
             context.draw(
-                strip.image,
+                strip,
                 in: CGRect(x: 0, y: cursorY, width: first.width, height: strip.height)
             )
         }
@@ -1030,13 +1483,40 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         return result
     }
 
-    nonisolated private static func detectedVerticalShift(
+    nonisolated fileprivate static func copiedRegion(
+        _ rect: CGRect,
+        from image: CGImage
+    ) -> CGImage? {
+        let imageBounds = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        let resolved = rect.integral.intersection(imageBounds)
+        guard resolved.width >= 1,
+              resolved.height >= 1,
+              let cropped = image.cropping(to: resolved),
+              let context = CGContext(
+                data: nil,
+                width: cropped.width,
+                height: cropped.height,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else { return nil }
+        context.draw(
+            cropped,
+            in: CGRect(x: 0, y: 0, width: cropped.width, height: cropped.height)
+        )
+        return context.makeImage()
+    }
+
+    nonisolated fileprivate static func detectedVerticalShift(
         from previous: CGImage,
         to next: CGImage
     ) throws -> Int {
-        let sampleWidth = min(220, previous.width, next.width)
-        let scale = CGFloat(sampleWidth) / CGFloat(max(1, min(previous.width, next.width)))
-        let sampleHeight = max(40, Int(CGFloat(min(previous.height, next.height)) * scale))
+        let commonWidth = max(1, min(previous.width, next.width))
+        let commonHeight = max(1, min(previous.height, next.height))
+        let sampleWidth = min(240, commonWidth)
+        let scale = CGFloat(sampleWidth) / CGFloat(commonWidth)
+        let sampleHeight = max(48, Int((CGFloat(commonHeight) * scale).rounded()))
         let previousPixels = try topDownRGBABytes(
             previous,
             width: sampleWidth,
@@ -1048,60 +1528,74 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
             height: sampleHeight
         )
 
-        var samePositionDifference: UInt64 = 0
-        var samePositionSamples: UInt64 = 0
-        var sameY = 3
-        while sameY < sampleHeight - 3 {
-            var sameX = 3
-            while sameX < sampleWidth - 3 {
-                let index = (sameY * sampleWidth + sameX) * 4
-                samePositionDifference += UInt64(abs(Int(previousPixels[index]) - Int(nextPixels[index])))
-                samePositionDifference += UInt64(abs(Int(previousPixels[index + 1]) - Int(nextPixels[index + 1])))
-                samePositionDifference += UInt64(abs(Int(previousPixels[index + 2]) - Int(nextPixels[index + 2])))
-                samePositionSamples += 3
-                sameX += 7
-            }
-            sameY += 7
-        }
-        if samePositionSamples > 0,
-           Double(samePositionDifference) / Double(samePositionSamples) < 0.8 {
-            return 0
-        }
+        let horizontalInset = max(3, sampleWidth / 28)
+        let topInset = max(4, sampleHeight / 12)
+        let bottomInset = max(4, sampleHeight / 20)
+        let xStep = max(2, sampleWidth / 72)
+        let yStep = max(2, sampleHeight / 96)
 
-        let minimumShift = max(1, sampleHeight / 160)
-        let maximumShift = max(minimumShift, Int(CGFloat(sampleHeight) * 0.88))
-        var bestShift = minimumShift
-        var bestScore = Double.greatestFiniteMagnitude
-
-        for shift in minimumShift...maximumShift {
-            let overlap = sampleHeight - shift
-            guard overlap >= 12 else { continue }
+        func score(for shift: Int) -> Double {
+            let endY = sampleHeight - bottomInset - shift
+            guard endY - topInset >= 12 else { return .greatestFiniteMagnitude }
             var difference: UInt64 = 0
-            var samples: UInt64 = 0
-            var y = 3
-            while y < overlap - 3 {
-                var x = 3
-                while x < sampleWidth - 3 {
+            var weightedSamples: UInt64 = 0
+            var y = topInset
+            while y < endY {
+                var x = horizontalInset
+                while x < sampleWidth - horizontalInset - xStep {
                     let previousIndex = ((y + shift) * sampleWidth + x) * 4
                     let nextIndex = (y * sampleWidth + x) * 4
-                    difference += UInt64(abs(Int(previousPixels[previousIndex]) - Int(nextPixels[nextIndex])))
-                    difference += UInt64(abs(Int(previousPixels[previousIndex + 1]) - Int(nextPixels[nextIndex + 1])))
-                    difference += UInt64(abs(Int(previousPixels[previousIndex + 2]) - Int(nextPixels[nextIndex + 2])))
-                    samples += 3
-                    x += 7
+                    let previousNeighbor = previousIndex + xStep * 4
+                    let nextNeighbor = nextIndex + xStep * 4
+                    let detail =
+                        abs(Int(previousPixels[previousIndex]) - Int(previousPixels[previousNeighbor])) +
+                        abs(Int(previousPixels[previousIndex + 1]) - Int(previousPixels[previousNeighbor + 1])) +
+                        abs(Int(previousPixels[previousIndex + 2]) - Int(previousPixels[previousNeighbor + 2])) +
+                        abs(Int(nextPixels[nextIndex]) - Int(nextPixels[nextNeighbor])) +
+                        abs(Int(nextPixels[nextIndex + 1]) - Int(nextPixels[nextNeighbor + 1])) +
+                        abs(Int(nextPixels[nextIndex + 2]) - Int(nextPixels[nextNeighbor + 2]))
+                    let weight = detail >= 18 ? 4 : 1
+                    difference += UInt64(weight * (
+                        abs(Int(previousPixels[previousIndex]) - Int(nextPixels[nextIndex])) +
+                        abs(Int(previousPixels[previousIndex + 1]) - Int(nextPixels[nextIndex + 1])) +
+                        abs(Int(previousPixels[previousIndex + 2]) - Int(nextPixels[nextIndex + 2]))
+                    ))
+                    weightedSamples += UInt64(weight * 3)
+                    x += xStep
                 }
-                y += 7
+                y += yStep
             }
-            guard samples > 0 else { continue }
-            let score = Double(difference) / Double(samples)
-            if score < bestScore {
-                bestScore = score
+            guard weightedSamples > 0 else { return .greatestFiniteMagnitude }
+            return Double(difference) / Double(weightedSamples)
+        }
+
+        let samePositionScore = score(for: 0)
+        if samePositionScore < 0.8 { return 0 }
+
+        let minimumShift = max(1, sampleHeight / 180)
+        let maximumShift = max(
+            minimumShift,
+            min(
+                sampleHeight - topInset - bottomInset - 12,
+                Int(CGFloat(sampleHeight) * 0.82)
+            )
+        )
+        var bestShift = 0
+        var bestScore = Double.greatestFiniteMagnitude
+        for shift in minimumShift...maximumShift {
+            let candidateScore = score(for: shift)
+            if candidateScore < bestScore {
+                bestScore = candidateScore
                 bestShift = shift
             }
         }
 
-        let originalHeight = min(previous.height, next.height)
-        return max(1, Int((CGFloat(bestShift) / CGFloat(sampleHeight) * CGFloat(originalHeight)).rounded()))
+        guard bestShift > 0,
+              bestScore < 22,
+              bestScore + 0.35 < samePositionScore || bestScore < samePositionScore * 0.82 else {
+            return 0
+        }
+        return max(1, Int((CGFloat(bestShift) / scale).rounded()))
     }
 
     nonisolated private static func topDownRGBABytes(

@@ -301,7 +301,7 @@ final class PinnedScreenshotController {
 }
 
 private final class PinnedScreenshotContentView: NSView {
-    private static let controlsSize = CGSize(width: 220, height: 74)
+    private static let controlsSize = CGSize(width: 204, height: 62)
 
     private let backgroundLayer = CALayer()
     private let imageLayer = CALayer()
@@ -468,7 +468,7 @@ private struct PinnedScreenshotControlsView: View {
                     FormaButton(
                         "",
                         systemImage: "xmark",
-                        role: .dark,
+                        role: .secondary,
                         size: .small,
                         depth: .raised,
                         action: onClose
@@ -493,17 +493,14 @@ private struct PinnedScreenshotControlsView: View {
     }
 
     private var opacityControl: some View {
-        FormaFloatingCard(padding: 8) {
-            FormaSlider(
-                "透明度",
-                value: $screenshotOpacity,
-                range: 0.15...1,
-                step: 0.05,
-                formatter: { "\(Int(($0 * 100).rounded()))%" }
-            )
-            .frame(width: 142)
-        }
-        .frame(width: 158, height: 58)
+        FormaSlider(
+            "透明度",
+            value: $screenshotOpacity,
+            range: 0.15...1,
+            step: 0.05,
+            formatter: { "\(Int(($0 * 100).rounded()))%" }
+        )
+        .frame(width: 142, height: 48)
         .delayedFormaHelp(
             "透明度",
             detail: "拖动滑条调整截图透明度，控制按钮保持清晰",

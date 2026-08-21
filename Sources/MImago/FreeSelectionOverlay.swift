@@ -282,16 +282,23 @@ private final class CaptureOverlaySession: ObservableObject {
 
 @MainActor
 enum FreeSelectionOverlay {
+    private static let dockSuppressionActiveKey = "capture.dock-magnification-suppression-active"
+    private static let dockSuppressionHadValueKey = "capture.dock-magnification-had-value"
+    private static let dockSuppressionPreviousValueKey = "capture.dock-magnification-previous-value"
     private static var activePanels: [CGDirectDisplayID: NSPanel] = [:]
+    private static var longScreenshotPreviewPanels: [CGDirectDisplayID: NSPanel] = [:]
     private static var escapeMonitor: Any?
     private static var cancelAction: (() -> Void)?
     private static var watchdogTask: Task<Void, Never>?
+    private static var previousDockMagnification: Bool?
+    private static var didOverrideDockMagnification = false
 
     static func present(
         on screens: [NSScreen],
         windowCandidatesByDisplayID: [CGDirectDisplayID: [CaptureWindowCandidate]],
         initialPointerGlobalLocation: CGPoint,
         onConfirm: @escaping (CaptureSelectionResult) -> Void,
+        onLongScreenshot: @escaping (CGImage) -> Void,
         onCancel: @escaping () -> Void
     ) {
         present(
@@ -300,6 +307,7 @@ enum FreeSelectionOverlay {
             windowCandidatesByDisplayID: windowCandidatesByDisplayID,
             initialPointerGlobalLocation: initialPointerGlobalLocation,
             onConfirm: { result, _ in onConfirm(result) },
+            onLongScreenshot: onLongScreenshot,
             onCancel: onCancel
         )
     }
@@ -320,6 +328,7 @@ enum FreeSelectionOverlay {
                 guard let options else { return }
                 onConfirm(result, options)
             },
+            onLongScreenshot: { _ in },
             onCancel: onCancel
         )
     }
@@ -330,6 +339,7 @@ enum FreeSelectionOverlay {
         windowCandidatesByDisplayID: [CGDirectDisplayID: [CaptureWindowCandidate]],
         initialPointerGlobalLocation: CGPoint,
         onConfirm: @escaping (CaptureSelectionResult, RecordingOptions?) -> Void,
+        onLongScreenshot: @escaping (CGImage) -> Void,
         onCancel: @escaping () -> Void
     ) {
         dismiss()
@@ -395,6 +405,15 @@ enum FreeSelectionOverlay {
                         dismiss()
                         onConfirm(result, options)
                     },
+                    onLongScreenshot: { image in
+                        DiagnosticLogStore.shared.log(
+                            .info,
+                            category: "capture-overlay",
+                            "long-screenshot-confirmed display=\(displayID) size=\(image.width)x\(image.height)"
+                        )
+                        dismiss()
+                        onLongScreenshot(image)
+                    },
                     onCancel: {
                         cancel()
                     }
@@ -434,6 +453,7 @@ enum FreeSelectionOverlay {
                 "overlay-remains-active-after-30-seconds panels=\(activePanels.count)"
             )
         }
+        suppressDockMagnification()
         NSApp.activate(ignoringOtherApps: true)
         for panel in activePanels.values where panel !== initialPanel {
             panel.orderFrontRegardless()
@@ -443,6 +463,54 @@ enum FreeSelectionOverlay {
 
     static func focusTextEditor(on displayID: CGDirectDisplayID) {
         (activePanels[displayID] as? CaptureOverlayPanel)?.focusTextEditor()
+    }
+
+    static func presentLongScreenshotPreview(
+        on displayID: CGDirectDisplayID,
+        position: CGPoint,
+        session: CaptureController.ManualLongScreenshotSession,
+        onFinish: @escaping () -> Void,
+        onCancel: @escaping () -> Void
+    ) {
+        guard let overlayPanel = activePanels[displayID] else { return }
+        dismissLongScreenshotPreview(on: displayID)
+        let panelSize = CGSize(width: 238, height: 268)
+        let panel = CaptureOverlayPanel(
+            contentRect: CGRect(origin: .zero, size: panelSize),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "M · Imago 长截图预览"
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        panel.contentView = NSHostingView(rootView: FormaUIRoot(soundCenter: ApplicationPreferences.shared.soundCenter) {
+            LongScreenshotPreviewCard(
+                session: session,
+                onFinish: onFinish,
+                onCancel: onCancel
+            )
+            .frame(width: panelSize.width, height: panelSize.height)
+        })
+        panel.setFrameOrigin(CGPoint(
+            x: overlayPanel.frame.minX + position.x - panelSize.width / 2,
+            y: overlayPanel.frame.maxY - position.y - panelSize.height / 2
+        ))
+        longScreenshotPreviewPanels[displayID] = panel
+        overlayPanel.ignoresMouseEvents = true
+        panel.orderFrontRegardless()
+    }
+
+    static func dismissLongScreenshotPreview(on displayID: CGDirectDisplayID) {
+        if let panel = longScreenshotPreviewPanels.removeValue(forKey: displayID) {
+            panel.orderOut(nil)
+            panel.close()
+        }
+        activePanels[displayID]?.ignoresMouseEvents = false
     }
 
     static func cancel() {
@@ -464,9 +532,68 @@ enum FreeSelectionOverlay {
             $0.orderOut(nil)
             $0.close()
         }
+        longScreenshotPreviewPanels.values.forEach {
+            $0.orderOut(nil)
+            $0.close()
+        }
+        longScreenshotPreviewPanels.removeAll()
         activePanels.removeAll()
         cancelAction = nil
+        restoreDockMagnificationIfNeeded()
         NSCursor.arrow.set()
+    }
+
+    private static func suppressDockMagnification() {
+        guard !didOverrideDockMagnification else { return }
+        let applicationID = "com.apple.dock" as CFString
+        let key = "magnification" as CFString
+        previousDockMagnification = (CFPreferencesCopyAppValue(key, applicationID) as? NSNumber)?
+            .boolValue
+        let defaults = UserDefaults.standard
+        defaults.set(true, forKey: dockSuppressionActiveKey)
+        defaults.set(previousDockMagnification != nil, forKey: dockSuppressionHadValueKey)
+        defaults.set(previousDockMagnification ?? false, forKey: dockSuppressionPreviousValueKey)
+        didOverrideDockMagnification = true
+        CFPreferencesSetAppValue(key, kCFBooleanFalse, applicationID)
+        CFPreferencesAppSynchronize(applicationID)
+        DistributedNotificationCenter.default().post(
+            name: Notification.Name("com.apple.dock.prefchanged"),
+            object: nil
+        )
+    }
+
+    static func restoreDockMagnificationIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard didOverrideDockMagnification || defaults.bool(forKey: dockSuppressionActiveKey) else {
+            return
+        }
+        let applicationID = "com.apple.dock" as CFString
+        let key = "magnification" as CFString
+        let hadPreviousValue = didOverrideDockMagnification
+            ? previousDockMagnification != nil
+            : defaults.bool(forKey: dockSuppressionHadValueKey)
+        let restoredValue = didOverrideDockMagnification
+            ? previousDockMagnification
+            : defaults.bool(forKey: dockSuppressionPreviousValueKey)
+        if hadPreviousValue, let restoredValue {
+            CFPreferencesSetAppValue(
+                key,
+                restoredValue ? kCFBooleanTrue : kCFBooleanFalse,
+                applicationID
+            )
+        } else {
+            CFPreferencesSetAppValue(key, nil, applicationID)
+        }
+        CFPreferencesAppSynchronize(applicationID)
+        DistributedNotificationCenter.default().post(
+            name: Notification.Name("com.apple.dock.prefchanged"),
+            object: nil
+        )
+        previousDockMagnification = nil
+        didOverrideDockMagnification = false
+        defaults.removeObject(forKey: dockSuppressionActiveKey)
+        defaults.removeObject(forKey: dockSuppressionHadValueKey)
+        defaults.removeObject(forKey: dockSuppressionPreviousValueKey)
     }
 }
 
@@ -574,12 +701,113 @@ private struct OverlayAnnotation: Identifiable, Sendable, Hashable {
     }
 }
 
+private struct LongScreenshotPreviewCard: View {
+    @ObservedObject var session: CaptureController.ManualLongScreenshotSession
+    let onFinish: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        FormaFloatingCard(padding: 10) {
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(spacing: 7) {
+                    Image(systemName: "rectangle.expand.vertical")
+                        .foregroundStyle(FormaTheme.accent)
+                    Text("长截图预览")
+                        .font(.formaBody(12, weight: .semibold))
+                    Spacer()
+                    FormaBadge(
+                        session.capturedFrameCount > 1
+                            ? "\(session.capturedFrameCount) 段"
+                            : "等待滚动",
+                        tone: session.capturedFrameCount > 1 ? .success : .info,
+                        size: .small
+                    )
+                }
+
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(FormaTheme.surface.opacity(0.72))
+                    if let previewImage = session.previewImage {
+                        Image(nsImage: NSImage(cgImage: previewImage, size: .zero))
+                            .resizable()
+                            .interpolation(.high)
+                            .scaledToFit()
+                            .padding(5)
+                    } else {
+                        FormaSpinner(size: .small, color: FormaTheme.accent)
+                    }
+                }
+                .frame(height: 164)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(FormaTheme.lineStrong, lineWidth: 1)
+                }
+                .transaction { transaction in
+                    transaction.animation = nil
+                }
+
+                HStack(spacing: 6) {
+                    Image(systemName: "computermouse.and.arrow.pointer")
+                        .foregroundStyle(FormaColor.inkSoft)
+                        .frame(width: 14, height: 14)
+                    Text(statusText)
+                        .font(.formaBody(10, weight: .medium))
+                        .foregroundStyle(
+                            session.errorMessage == nil
+                                ? FormaColor.inkSoft
+                                : FormaColor.accent
+                        )
+                        .lineLimit(1)
+                    Spacer()
+                }
+
+                HStack(spacing: 8) {
+                    FormaButton(
+                        "退出",
+                        systemImage: "xmark",
+                        role: .secondary,
+                        size: .small,
+                        depth: .raised,
+                        action: onCancel
+                    )
+                    FormaButton(
+                        "完成长图",
+                        systemImage: "checkmark",
+                        role: .primary,
+                        size: .small,
+                        depth: .raised,
+                        action: onFinish
+                    )
+                    .disabled(session.capturedFrameCount < 2)
+                }
+            }
+        }
+        .contentShape(Rectangle())
+        .onHover { isInside in
+            if isInside { NSCursor.arrow.set() }
+        }
+        .shadow(color: .black.opacity(0.34), radius: 10, y: 4)
+    }
+
+    private var statusText: String {
+        if let errorMessage = session.errorMessage {
+            return errorMessage
+        }
+        if session.capturedFrameCount > 1 {
+            return "继续滚动，或完成长图"
+        }
+        return "在选区内向下滚动"
+    }
+}
+
 private struct FreeSelectionOverlayView: View {
     let purpose: CaptureOverlayPurpose
     let displayID: CGDirectDisplayID
     @ObservedObject var session: CaptureOverlaySession
     let windowCandidates: [CaptureWindowCandidate]
     let onConfirm: (CaptureSelectionResult, RecordingOptions?) -> Void
+    let onLongScreenshot: (CGImage) -> Void
     let onCancel: () -> Void
 
     @State private var hoveredWindow: CaptureWindowCandidate?
@@ -606,6 +834,7 @@ private struct FreeSelectionOverlayView: View {
     @State private var annotationDragStart: OverlayAnnotation?
     @State private var recordingCountdownValue: Int?
     @State private var recordingCountdownTask: Task<Void, Never>?
+    @State private var longScreenshotSession: CaptureController.ManualLongScreenshotSession?
 
     init(
         purpose: CaptureOverlayPurpose,
@@ -614,6 +843,7 @@ private struct FreeSelectionOverlayView: View {
         windowCandidates: [CaptureWindowCandidate],
         initialPointerLocation: CGPoint,
         onConfirm: @escaping (CaptureSelectionResult, RecordingOptions?) -> Void,
+        onLongScreenshot: @escaping (CGImage) -> Void,
         onCancel: @escaping () -> Void
     ) {
         self.purpose = purpose
@@ -621,6 +851,7 @@ private struct FreeSelectionOverlayView: View {
         self.session = session
         self.windowCandidates = windowCandidates
         self.onConfirm = onConfirm
+        self.onLongScreenshot = onLongScreenshot
         self.onCancel = onCancel
         _hoveredWindow = State(initialValue: windowCandidates.first { $0.frame.contains(initialPointerLocation) })
     }
@@ -712,6 +943,7 @@ private struct FreeSelectionOverlayView: View {
                             && expandedStyleTool == nil
                             && textDraftPosition == nil
                             && recordingCountdownValue == nil
+                            && longScreenshotSession == nil
                         resizeEdgeHitAreas(for: selection.frame, in: screenBounds)
                             .allowsHitTesting(resizingEnabled)
                             .zIndex(100)
@@ -725,7 +957,8 @@ private struct FreeSelectionOverlayView: View {
 
                     if confirmedSelection != nil,
                        draftSelectionStart == nil,
-                       recordingCountdownValue == nil {
+                       recordingCountdownValue == nil,
+                       longScreenshotSession == nil {
                         captureControls(for: highlight, in: screenBounds)
                     }
 
@@ -766,6 +999,8 @@ private struct FreeSelectionOverlayView: View {
         .onDisappear {
             recordingCountdownTask?.cancel()
             recordingCountdownTask = nil
+            longScreenshotSession?.stop()
+            FreeSelectionOverlay.dismissLongScreenshotPreview(on: displayID)
             NSCursor.arrow.set()
         }
     }
@@ -773,6 +1008,7 @@ private struct FreeSelectionOverlayView: View {
     private func primaryGesture(in bounds: CGRect) -> some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
+                guard longScreenshotSession == nil else { return }
                 if confirmedSelection == nil {
                     let distance = hypot(value.translation.width, value.translation.height)
                     guard distance >= 3 else { return }
@@ -858,6 +1094,7 @@ private struct FreeSelectionOverlayView: View {
                 }
             }
             .onEnded { value in
+                guard longScreenshotSession == nil else { return }
                 if confirmedSelection == nil {
                     if let start = draftSelectionStart,
                        let end = draftSelectionEnd {
@@ -1071,15 +1308,12 @@ private struct FreeSelectionOverlayView: View {
                 tool: .highlight
             )
             actionButton(
-                "rectangle.stack.badge.plus",
+                "rectangle.expand.vertical",
                 label: "截长图",
-                help: confirmedSelection?.isWindow == true
-                    ? "自动滚动当前窗口并拼接成长图"
-                    : "请先单击选择一个可滚动窗口，再使用截长图",
-                role: .secondary,
-                isEnabled: confirmedSelection?.isWindow == true
+                help: "窗口或自由选区都可进入；向下滚动并在角落预览拼接结果",
+                role: .secondary
             ) {
-                confirm(in: bounds, action: .longScreenshot)
+                beginLongScreenshot(in: bounds)
             }
             actionButton("pin", label: "置顶截图", help: "完成编辑并将截图独立置顶显示", role: .secondary) {
                 confirm(in: bounds, action: .pin)
@@ -1667,8 +1901,8 @@ private struct FreeSelectionOverlayView: View {
                             Path(rect),
                             with: .color(
                                 isDark
-                                    ? Color(red: 0.38, green: 0.40, blue: 0.42).opacity(0.78)
-                                    : Color(red: 0.62, green: 0.64, blue: 0.66).opacity(0.68)
+                                    ? Color(red: 0.72, green: 0.73, blue: 0.75).opacity(0.82)
+                                    : Color(red: 0.86, green: 0.87, blue: 0.89).opacity(0.78)
                             )
                         )
                     }
@@ -2178,10 +2412,117 @@ private struct FreeSelectionOverlayView: View {
         )
     }
 
+    private func beginLongScreenshot(in bounds: CGRect) {
+        guard purpose == .screenshot,
+              longScreenshotSession == nil,
+              let confirmedSelection else { return }
+
+        if textDraftPosition != nil {
+            commitTextDraft()
+        }
+        activeTool = nil
+        expandedStyleTool = nil
+        selectedAnnotationID = nil
+        hoveredAnnotationID = nil
+        annotationDraft = nil
+
+        let source: CaptureController.ManualLongScreenshotSource
+        switch confirmedSelection {
+        case let .window(candidate):
+            source = .window(windowID: candidate.windowID, processID: candidate.processID)
+        case let .region(rect):
+            source = .region(
+                displayID: displayID,
+                normalizedRect: CGRect(
+                    x: rect.minX / bounds.width,
+                    y: rect.minY / bounds.height,
+                    width: rect.width / bounds.width,
+                    height: rect.height / bounds.height
+                )
+            )
+        }
+
+        let captureSession = CaptureController.ManualLongScreenshotSession(
+            source: source
+        )
+        longScreenshotSession = captureSession
+        captureSession.start()
+        FreeSelectionOverlay.presentLongScreenshotPreview(
+            on: displayID,
+            position: longScreenshotPreviewPosition(
+                selection: confirmedSelection.frame,
+                in: bounds,
+                panelSize: CGSize(width: 238, height: 268)
+            ),
+            session: captureSession,
+            onFinish: finishLongScreenshot,
+            onCancel: cancelLongScreenshot
+        )
+    }
+
+    private func cancelLongScreenshot() {
+        longScreenshotSession?.stop()
+        longScreenshotSession = nil
+        FreeSelectionOverlay.dismissLongScreenshotPreview(on: displayID)
+        updateCursor()
+    }
+
+    private func finishLongScreenshot() {
+        guard let captureSession = longScreenshotSession,
+              let image = captureSession.finishedImage() else { return }
+        captureSession.stop()
+        longScreenshotSession = nil
+        FreeSelectionOverlay.dismissLongScreenshotPreview(on: displayID)
+        onLongScreenshot(image)
+    }
+
+    private func longScreenshotPreviewPosition(
+        selection: CGRect,
+        in bounds: CGRect,
+        panelSize: CGSize
+    ) -> CGPoint {
+        let inset: CGFloat = 14
+        let left = CGPoint(
+            x: bounds.minX + inset + panelSize.width / 2,
+            y: bounds.maxY - inset - panelSize.height / 2
+        )
+        let right = CGPoint(
+            x: bounds.maxX - inset - panelSize.width / 2,
+            y: bounds.maxY - inset - panelSize.height / 2
+        )
+        let leftFrame = CGRect(
+            x: left.x - panelSize.width / 2,
+            y: left.y - panelSize.height / 2,
+            width: panelSize.width,
+            height: panelSize.height
+        )
+        let rightFrame = CGRect(
+            x: right.x - panelSize.width / 2,
+            y: right.y - panelSize.height / 2,
+            width: panelSize.width,
+            height: panelSize.height
+        )
+        let leftIntersection = leftFrame.intersection(selection)
+        let rightIntersection = rightFrame.intersection(selection)
+        let leftOverlap = leftIntersection.isNull
+            ? 0
+            : leftIntersection.width * leftIntersection.height
+        let rightOverlap = rightIntersection.isNull
+            ? 0
+            : rightIntersection.width * rightIntersection.height
+        if abs(leftOverlap - rightOverlap) > 1 {
+            return leftOverlap < rightOverlap ? left : right
+        }
+        return selection.midX < bounds.midX ? right : left
+    }
+
     private func cancel() {
         recordingCountdownTask?.cancel()
         recordingCountdownTask = nil
         recordingCountdownValue = nil
+        longScreenshotSession?.stop()
+        longScreenshotSession = nil
+        FreeSelectionOverlay.dismissLongScreenshotPreview(on: displayID)
         onCancel()
     }
 
