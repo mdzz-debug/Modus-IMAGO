@@ -172,6 +172,32 @@ private final class CaptureOverlayPanel: NSPanel {
     override var canBecomeMain: Bool { false }
     var onCancelRequested: (() -> Void)?
 
+    func focusTextEditor(remainingAttempts: Int = 8) {
+        NSApp.activate(ignoringOtherApps: true)
+        makeKeyAndOrderFront(nil)
+        guard let textField = contentView?.firstEditableTextField else {
+            guard remainingAttempts > 0 else {
+                DiagnosticLogStore.shared.log(
+                    .warning,
+                    category: "capture-overlay",
+                    "text-editor-focus-failed"
+                )
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) { [weak self] in
+                self?.focusTextEditor(remainingAttempts: remainingAttempts - 1)
+            }
+            return
+        }
+        makeFirstResponder(textField)
+        textField.selectText(nil)
+        DiagnosticLogStore.shared.log(
+            .debug,
+            category: "capture-overlay",
+            "text-editor-focused"
+        )
+    }
+
     override func sendEvent(_ event: NSEvent) {
         if event.type == .keyDown, event.keyCode == 53 {
             onCancelRequested?()
@@ -205,6 +231,23 @@ private final class CaptureOverlayPanel: NSPanel {
         // display frame makes SwiftUI selection coordinates map one-to-one to
         // ScreenCaptureKit source coordinates.
         frameRect
+    }
+}
+
+private extension NSView {
+    var firstEditableTextField: NSTextField? {
+        if let textField = self as? NSTextField,
+           textField.isEditable,
+           textField.isEnabled,
+           !textField.isHidden {
+            return textField
+        }
+        for subview in subviews.reversed() {
+            if let textField = subview.firstEditableTextField {
+                return textField
+            }
+        }
+        return nil
     }
 }
 
@@ -312,17 +355,26 @@ enum FreeSelectionOverlay {
 
             let panel = CaptureOverlayPanel(
                 contentRect: screen.frame,
-                styleMask: [.borderless, .nonactivatingPanel],
+                styleMask: [.borderless],
                 backing: .buffered,
                 defer: false
             )
+            panel.title = "M · Imago 截图遮罩"
             panel.isOpaque = false
             panel.backgroundColor = .clear
             panel.hasShadow = false
             panel.level = .screenSaver
             panel.hidesOnDeactivate = false
-            panel.becomesKeyOnlyIfNeeded = true
-            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            panel.becomesKeyOnlyIfNeeded = false
+            panel.ignoresMouseEvents = false
+            panel.isMovable = false
+            panel.isExcludedFromWindowsMenu = true
+            panel.collectionBehavior = [
+                .canJoinAllSpaces,
+                .fullScreenAuxiliary,
+                .stationary,
+                .ignoresCycle
+            ]
             panel.acceptsMouseMovedEvents = true
             panel.onCancelRequested = {
                 Task { @MainActor in cancel() }
@@ -387,6 +439,10 @@ enum FreeSelectionOverlay {
             panel.orderFrontRegardless()
         }
         (initialPanel ?? activePanels.values.first)?.makeKeyAndOrderFront(nil)
+    }
+
+    static func focusTextEditor(on displayID: CGDirectDisplayID) {
+        (activePanels[displayID] as? CaptureOverlayPanel)?.focusTextEditor()
     }
 
     static func cancel() {
@@ -1743,6 +1799,7 @@ private struct FreeSelectionOverlayView: View {
         selectedAnnotationID = nil
         activeTool = .text
         expandedStyleTool = .text
+        focusTextEditorAfterLayout()
     }
 
     private func beginEditingText(_ annotation: OverlayAnnotation) {
@@ -1757,6 +1814,14 @@ private struct FreeSelectionOverlayView: View {
         selectedAnnotationID = annotation.id
         activeTool = .text
         expandedStyleTool = .text
+        focusTextEditorAfterLayout()
+    }
+
+    private func focusTextEditorAfterLayout() {
+        Task { @MainActor in
+            await Task.yield()
+            FreeSelectionOverlay.focusTextEditor(on: displayID)
+        }
     }
 
     private func updateEditingTextStyle() {
