@@ -1609,7 +1609,11 @@ private struct FreeSelectionOverlayView: View {
                         let isDark = (row + column + Int(center.x / block) + Int(center.y / block)).isMultiple(of: 2)
                         context.fill(
                             Path(rect),
-                            with: .color(isDark ? .black.opacity(0.44) : .white.opacity(0.30))
+                            with: .color(
+                                isDark
+                                    ? Color(red: 0.38, green: 0.40, blue: 0.42).opacity(0.78)
+                                    : Color(red: 0.62, green: 0.64, blue: 0.66).opacity(0.68)
+                            )
                         )
                     }
                 }

@@ -10,6 +10,53 @@ import ScreenCaptureKit
 final class MImagoPermissions {
     static let shared = MImagoPermissions()
     let center = FormaPermissionCenter()
+    private var hasPromptedForAccessibilityThisLaunch = false
+
+    func ensureAccessibilityAuthorization() async -> Bool {
+        let axTrusted = AXIsProcessTrusted()
+        let canPostEvents = CGPreflightPostEventAccess()
+        if axTrusted || canPostEvents {
+            _ = await center.refresh(.accessibility)
+            DiagnosticLogStore.shared.log(
+                .info,
+                category: "permission",
+                "accessibility-ready ax=\(axTrusted) post-events=\(canPostEvents)"
+            )
+            return true
+        }
+
+        let refreshed = await center.refresh(.accessibility)
+        if refreshed == .authorized {
+            DiagnosticLogStore.shared.log(
+                .info,
+                category: "permission",
+                "accessibility-ready center=authorized ax=false post-events=false"
+            )
+            return true
+        }
+
+        guard !hasPromptedForAccessibilityThisLaunch else {
+            DiagnosticLogStore.shared.log(
+                .warning,
+                category: "permission",
+                "accessibility-still-unavailable prompt-suppressed status=\(String(describing: refreshed))"
+            )
+            return false
+        }
+
+        hasPromptedForAccessibilityThisLaunch = true
+        let requested = await center.request(.accessibility)
+        try? await Task.sleep(for: .milliseconds(180))
+        let isReady = AXIsProcessTrusted()
+            || CGPreflightPostEventAccess()
+            || requested == .authorized
+        DiagnosticLogStore.shared.log(
+            isReady ? .info : .warning,
+            category: "permission",
+            "accessibility-request-result status=\(String(describing: requested)) ready=\(isReady)"
+        )
+        return isReady
+    }
 
     func ensureMicrophoneAuthorization() async -> Bool {
         let current = await center.refresh(.microphone)
@@ -770,17 +817,8 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         windowFrame: CGRect,
         progress: @escaping @MainActor (Int) -> Void
     ) async throws -> CGImage {
-        guard CGPreflightPostEventAccess() else {
-            let permission = await MImagoPermissions.shared.center.request(.accessibility)
-            guard permission == .authorized, CGPreflightPostEventAccess() else {
-                throw CaptureError.accessibilityPermissionRequired
-            }
-            return try await captureLongWindowUsingScrollEvents(
-                windowID: windowID,
-                processID: processID,
-                windowFrame: windowFrame,
-                progress: progress
-            )
+        guard await MImagoPermissions.shared.ensureAccessibilityAuthorization() else {
+            throw CaptureError.accessibilityPermissionRequired
         }
 
         var frames: [CGImage] = []
@@ -1538,7 +1576,8 @@ private enum CaptureError: LocalizedError {
         case .windowUnavailable: "选中的窗口已经关闭或暂时不可捕获。"
         case .longScreenshotRequiresWindow: "截长图需要先单击选择一个窗口。"
         case .scrollableContentUnavailable: "没有在选中窗口中找到可滚动区域。"
-        case .accessibilityPermissionRequired: "截长图需要在系统设置中开启辅助功能权限。"
+        case .accessibilityPermissionRequired:
+            "截长图未获得辅助功能控制权限。若系统设置已经开启，请完全退出并重新打开 M · Imago。"
         case .longScreenshotNoMovement: "窗口内容没有发生滚动，无法生成长图。"
         case .longScreenshotTooLarge: "长图尺寸超过当前版本的安全限制。"
         }
