@@ -47,8 +47,8 @@ final class UpdateController {
     private let latestReleaseURL = URL(
         string: "https://api.github.com/repos/mdzz-debug/Modus-IMAGO/releases/latest"
     )!
-    private let latestReleasePageURL = URL(
-        string: "https://github.com/mdzz-debug/Modus-IMAGO/releases/latest"
+    private let releaseManifestURL = URL(
+        string: "https://raw.githubusercontent.com/mdzz-debug/Modus-IMAGO/main/updates/latest.json"
     )!
     private var isChecking = false
 
@@ -104,7 +104,18 @@ final class UpdateController {
             forHTTPHeaderField: "User-Agent"
         )
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            DiagnosticLogStore.shared.log(
+                .warning,
+                category: "update",
+                "github-api-request-failed error=\(error.localizedDescription)"
+            )
+            return try await fetchLatestReleaseFromManifest()
+        }
         guard let httpResponse = response as? HTTPURLResponse else {
             throw UpdateError.invalidResponse
         }
@@ -118,7 +129,7 @@ final class UpdateController {
                 "github-api-limited status=\(httpResponse.statusCode) "
                     + "remaining=\(httpResponse.value(forHTTPHeaderField: "X-RateLimit-Remaining") ?? "unknown")"
             )
-            return try await fetchLatestReleaseFromRedirect()
+            return try await fetchLatestReleaseFromManifest()
         }
         guard (200..<300).contains(httpResponse.statusCode) else {
             throw UpdateError.httpStatus(httpResponse.statusCode)
@@ -126,42 +137,37 @@ final class UpdateController {
         return try JSONDecoder().decode(GitHubRelease.self, from: data)
     }
 
-    private func fetchLatestReleaseFromRedirect() async throws -> GitHubRelease? {
-        var request = URLRequest(url: latestReleasePageURL)
+    private func fetchLatestReleaseFromManifest() async throws -> GitHubRelease? {
+        var request = URLRequest(url: releaseManifestURL)
         request.timeoutInterval = 15
         request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue(
+            "application/json",
+            forHTTPHeaderField: "Accept"
+        )
         request.setValue(
             "M-Imago/\(currentVersion)",
             forHTTPHeaderField: "User-Agent"
         )
 
-        let (_, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse,
-              let finalURL = httpResponse.url else {
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
             throw UpdateError.invalidResponse
         }
-        guard (200..<400).contains(httpResponse.statusCode) else {
-            throw UpdateError.httpStatus(httpResponse.statusCode)
-        }
-        guard finalURL.path.contains("/releases/tag/"),
-              let encodedTag = finalURL.pathComponents.last,
-              !encodedTag.isEmpty else {
+        if httpResponse.statusCode == 404 {
             return nil
         }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw UpdateError.httpStatus(httpResponse.statusCode)
+        }
 
-        let tag = encodedTag.removingPercentEncoding ?? encodedTag
+        let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
         DiagnosticLogStore.shared.log(
             .info,
             category: "update",
-            "github-release-fallback-succeeded tag=\(tag)"
+            "github-release-manifest-succeeded tag=\(release.tagName)"
         )
-        return GitHubRelease(
-            tagName: tag,
-            name: nil,
-            htmlURL: finalURL,
-            draft: false,
-            prerelease: false
-        )
+        return release
     }
 
     private var currentVersion: String {
