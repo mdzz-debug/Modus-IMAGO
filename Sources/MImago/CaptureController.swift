@@ -660,23 +660,12 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         Task { [weak self] in
             defer { self?.finishCaptureOverlaySession() }
             do {
-                if case let .window(windowID, processID) = result.target {
-                    // Frozen-window screenshots no longer pass through the
-                    // live window capture fallback, so explicitly restore the
-                    // original behavior of activating only the chosen window.
-                    Self.raiseWindow(windowID: windowID, processID: processID)
-                    DiagnosticLogStore.shared.log(
-                        .debug,
-                        category: "screenshot",
-                        "selected-window-raised id=\(windowID) pid=\(processID)"
-                    )
-                }
-                try await Task.sleep(for: .milliseconds(120))
-
                 if result.action == .longScreenshot {
                     guard case let .window(windowID, processID) = result.target else {
                         throw CaptureError.longScreenshotRequiresWindow
                     }
+                    Self.raiseWindow(windowID: windowID, processID: processID)
+                    try await Task.sleep(for: .milliseconds(180))
                     let longImage = try await Self.captureLongWindowImage(
                         windowID: windowID,
                         processID: processID,
@@ -693,20 +682,32 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
                 }
 
                 let captured: CGImage
-                if let frozenImage = self?.frozenDisplayImages[result.displayID] {
-                    captured = try Self.cropFrozenDisplayImage(
-                        frozenImage,
-                        normalizedRect: result.normalizedFrame
+                switch result.target {
+                case let .window(windowID, processID):
+                    // Window capture intentionally switches back to a live,
+                    // desktop-independent image after selection. This lets the
+                    // target app repaint its title bar and controls as active
+                    // before the final image is produced.
+                    Self.raiseWindow(windowID: windowID, processID: processID)
+                    DiagnosticLogStore.shared.log(
+                        .debug,
+                        category: "screenshot",
+                        "selected-window-raised-before-capture id=\(windowID) pid=\(processID)"
                     )
-                } else {
-                    switch result.target {
-                    case let .window(windowID, processID):
-                        try await Task.sleep(for: .milliseconds(180))
-                        captured = try await Self.captureWindowImage(
-                            windowID: windowID,
-                            processID: processID
+                    try await Task.sleep(for: .milliseconds(180))
+                    captured = try await Self.captureWindowImage(
+                        windowID: windowID,
+                        processID: processID
+                    )
+
+                case let .region(displayID, normalizedRect):
+                    try await Task.sleep(for: .milliseconds(120))
+                    if let frozenImage = self?.frozenDisplayImages[result.displayID] {
+                        captured = try Self.cropFrozenDisplayImage(
+                            frozenImage,
+                            normalizedRect: result.normalizedFrame
                         )
-                    case let .region(displayID, normalizedRect):
+                    } else {
                         captured = try await Self.captureDisplayRegionImage(
                             displayID: displayID,
                             normalizedRect: normalizedRect
@@ -1498,7 +1499,11 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
             .max { lhs, rhs in
                 lhs.frame.intersection(window.frame).area < rhs.frame.intersection(window.frame).area
             }
-            .map { CGFloat($0.width) / max(1, $0.frame.width) }
+            .map { display in
+                let backingPixelWidth = CGDisplayCopyDisplayMode(display.displayID)?.pixelWidth
+                    ?? display.width
+                return CGFloat(backingPixelWidth) / max(1, display.frame.width)
+            }
             ?? 1
         configuration.width = max(1, Int((window.frame.width * sourceScale).rounded()))
         configuration.height = max(1, Int((window.frame.height * sourceScale).rounded()))
