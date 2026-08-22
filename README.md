@@ -37,7 +37,11 @@ zsh scripts/build-release.sh 0.1.0 1
 
 产物位于 `dist/v0.1.0/`。在 GitHub 创建正式 Release，标签必须使用与 App 版本对应的 `v0.1.0`，并上传 DMG、ZIP 和 `SHA256SUMS.txt`。
 
-每次正式发布还需要同步更新 `updates/latest.json` 中的版本、标题和 Release 地址。应用内“通用 → 应用信息 → 检查更新”默认读取最新的正式 GitHub Release；GitHub API 限流时会自动改读该清单，草稿和预发布版本不会提示。
+从 `0.1.1` 起应用使用 Sparkle 2 自动更新。通用面板可以启用“每天自动检查更新”；发现新版本后会在应用内显示版本说明、下载进度，并自动替换应用后重新启动。
+
+发布前先更新 `updates/release-notes.md`，然后执行构建脚本。脚本会使用登录钥匙串中账号 `com.modus.imago` 的 Sparkle EdDSA 私钥签名 ZIP，并生成及同步 `updates/appcast.xml`。私钥只保存在本机钥匙串，禁止导出或提交到仓库。
+
+构建完成后，先提交并推送更新后的 `updates/appcast.xml`，再创建对应 Tag 和正式 Release，上传 DMG、ZIP、`appcast.xml` 与 `SHA256SUMS.txt`。`0.1.0` 用户需要手动安装一次 `0.1.1`；此后的版本可以直接在应用内更新。
 
 ## 诊断日志
 

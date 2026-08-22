@@ -785,6 +785,8 @@ private struct FeedbackSettings: View {
 }
 
 private struct ApplicationInfoSettings: View {
+    @ObservedObject private var updates = UpdateController.shared
+
     private var version: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发版"
     }
@@ -805,9 +807,18 @@ private struct ApplicationInfoSettings: View {
                     FormaBadge(version, tone: .success, size: .small)
                 }
                 FormaSectionDivider()
+                SettingsSwitchRow(
+                    "每天自动检查更新",
+                    detail: "每天在后台检查一次；发现新版本后显示下载与安装面板",
+                    isOn: Binding(
+                        get: { updates.automaticallyChecksForUpdates },
+                        set: { updates.setAutomaticallyChecksForUpdates($0) }
+                    )
+                )
+                FormaSectionDivider()
                 FormaFormRow(
                     "软件更新",
-                    detail: "从 GitHub Releases 检查新版本",
+                    detail: "检查、下载并自动安装新版本",
                     size: .small
                 ) {
                     FormaButton(

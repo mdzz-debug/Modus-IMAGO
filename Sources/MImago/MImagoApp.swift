@@ -26,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         FreeSelectionOverlay.restoreDockMagnificationIfNeeded()
         DiagnosticLogStore.shared.start()
         _ = ShortcutSettingsStore.shared
+        UpdateController.shared.start()
         let launchedAtLogin = NSAppleEventManager.shared().currentAppleEvent?
             .paramDescriptor(forKeyword: AEKeyword(keyAELaunchedAsLogInItem)) != nil
         NSApp.setActivationPolicy(launchedAtLogin ? .accessory : .regular)

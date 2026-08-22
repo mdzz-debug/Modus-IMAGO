@@ -9,6 +9,13 @@
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>LSMinimumSystemVersion</key><string>26.0</string>
+  <key>SUFeedURL</key><string>https://raw.githubusercontent.com/mdzz-debug/Modus-IMAGO/main/updates/appcast.xml</string>
+  <key>SUPublicEDKey</key><string>4GJ/31K2n9BEEjMhSXp8C7fhpyM2ydGlYf8QVCoJLPY=</string>
+  <key>SUEnableAutomaticChecks</key><true/>
+  <key>SUScheduledCheckInterval</key><integer>86400</integer>
+  <key>SUAllowsAutomaticUpdates</key><true/>
+  <key>SUAutomaticallyUpdate</key><false/>
   <key>NSMicrophoneUsageDescription</key><string>M · Imago 使用麦克风录制屏幕讲解。</string>
   <key>NSCameraUsageDescription</key><string>M · Imago 使用摄像头录制画中画。</string>
 </dict></plist>

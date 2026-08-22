@@ -15,9 +15,20 @@ let package = Package(
         .executableTarget(
             name: "MImago",
             dependencies: [
-                .product(name: "FormaUI", package: "FormaUI")
+                .product(name: "FormaUI", package: "FormaUI"),
+                "Sparkle"
             ],
-            resources: [.process("Resources")]
+            resources: [.process("Resources")],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-rpath",
+                    "-Xlinker", "@executable_path/../Frameworks"
+                ])
+            ]
+        ),
+        .binaryTarget(
+            name: "Sparkle",
+            path: "ThirdParty/Sparkle/Sparkle.xcframework"
         )
     ]
 )

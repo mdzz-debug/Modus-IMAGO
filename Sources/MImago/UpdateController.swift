@@ -1,241 +1,56 @@
-import AppKit
-import Foundation
+import Combine
+import Sparkle
 
 @MainActor
-final class UpdateController {
+final class UpdateController: NSObject, ObservableObject {
     static let shared = UpdateController()
 
-    private struct GitHubRelease: Decodable {
-        let tagName: String
-        let name: String?
-        let htmlURL: URL
-        let draft: Bool
-        let prerelease: Bool
+    @Published private(set) var automaticallyChecksForUpdates = true
 
-        enum CodingKeys: String, CodingKey {
-            case tagName = "tag_name"
-            case name
-            case htmlURL = "html_url"
-            case draft
-            case prerelease
-        }
+    private let updaterController: SPUStandardUpdaterController
+    private var hasStarted = false
+
+    private override init() {
+        updaterController = SPUStandardUpdaterController(
+            startingUpdater: false,
+            updaterDelegate: nil,
+            userDriverDelegate: nil
+        )
+        super.init()
     }
 
-    private struct ReleaseVersion: Comparable {
-        let components: [Int]
-
-        init(_ rawValue: String) {
-            let normalized = rawValue
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
-            components = normalized.split(separator: ".").map { component in
-                Int(component.prefix { $0.isNumber }) ?? 0
-            }
-        }
-
-        static func < (lhs: ReleaseVersion, rhs: ReleaseVersion) -> Bool {
-            let count = max(lhs.components.count, rhs.components.count)
-            for index in 0..<count {
-                let left = index < lhs.components.count ? lhs.components[index] : 0
-                let right = index < rhs.components.count ? rhs.components[index] : 0
-                if left != right { return left < right }
-            }
-            return false
-        }
+    func start() {
+        guard !hasStarted else { return }
+        hasStarted = true
+        updaterController.startUpdater()
+        automaticallyChecksForUpdates = updaterController.updater
+            .automaticallyChecksForUpdates
+        DiagnosticLogStore.shared.log(
+            .info,
+            category: "update",
+            "sparkle-started automatic=\(automaticallyChecksForUpdates) "
+                + "interval=\(Int(updaterController.updater.updateCheckInterval))"
+        )
     }
-
-    private let latestReleaseURL = URL(
-        string: "https://api.github.com/repos/mdzz-debug/Modus-IMAGO/releases/latest"
-    )!
-    private let releaseManifestURL = URL(
-        string: "https://raw.githubusercontent.com/mdzz-debug/Modus-IMAGO/main/updates/latest.json"
-    )!
-    private var isChecking = false
-
-    private init() {}
 
     func checkForUpdates() {
-        guard !isChecking else { return }
-        isChecking = true
+        start()
         DiagnosticLogStore.shared.log(
             .info,
             category: "update",
-            "manual-update-check-requested"
+            "manual-sparkle-update-check-requested"
         )
-
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { isChecking = false }
-            do {
-                guard let release = try await fetchLatestRelease() else {
-                    showNoPublishedReleaseAlert()
-                    return
-                }
-                guard !release.draft, !release.prerelease else {
-                    showNoPublishedReleaseAlert()
-                    return
-                }
-                showResult(for: release)
-            } catch {
-                DiagnosticLogStore.shared.log(
-                    .warning,
-                    category: "update",
-                    "manual-update-check-failed error=\(error.localizedDescription)"
-                )
-                showFailureAlert(error)
-            }
-        }
+        updaterController.checkForUpdates(nil)
     }
 
-    private func fetchLatestRelease() async throws -> GitHubRelease? {
-        var request = URLRequest(url: latestReleaseURL)
-        request.timeoutInterval = 15
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        request.setValue(
-            "application/vnd.github+json",
-            forHTTPHeaderField: "Accept"
-        )
-        request.setValue(
-            "2022-11-28",
-            forHTTPHeaderField: "X-GitHub-Api-Version"
-        )
-        request.setValue(
-            "M-Imago/\(currentVersion)",
-            forHTTPHeaderField: "User-Agent"
-        )
-
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await URLSession.shared.data(for: request)
-        } catch {
-            DiagnosticLogStore.shared.log(
-                .warning,
-                category: "update",
-                "github-api-request-failed error=\(error.localizedDescription)"
-            )
-            return try await fetchLatestReleaseFromManifest()
-        }
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw UpdateError.invalidResponse
-        }
-        if httpResponse.statusCode == 404 {
-            return nil
-        }
-        if httpResponse.statusCode == 403 || httpResponse.statusCode == 429 {
-            DiagnosticLogStore.shared.log(
-                .warning,
-                category: "update",
-                "github-api-limited status=\(httpResponse.statusCode) "
-                    + "remaining=\(httpResponse.value(forHTTPHeaderField: "X-RateLimit-Remaining") ?? "unknown")"
-            )
-            return try await fetchLatestReleaseFromManifest()
-        }
-        guard (200..<300).contains(httpResponse.statusCode) else {
-            throw UpdateError.httpStatus(httpResponse.statusCode)
-        }
-        return try JSONDecoder().decode(GitHubRelease.self, from: data)
-    }
-
-    private func fetchLatestReleaseFromManifest() async throws -> GitHubRelease? {
-        var request = URLRequest(url: releaseManifestURL)
-        request.timeoutInterval = 15
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        request.setValue(
-            "application/json",
-            forHTTPHeaderField: "Accept"
-        )
-        request.setValue(
-            "M-Imago/\(currentVersion)",
-            forHTTPHeaderField: "User-Agent"
-        )
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw UpdateError.invalidResponse
-        }
-        if httpResponse.statusCode == 404 {
-            return nil
-        }
-        guard (200..<300).contains(httpResponse.statusCode) else {
-            throw UpdateError.httpStatus(httpResponse.statusCode)
-        }
-
-        let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
+    func setAutomaticallyChecksForUpdates(_ isEnabled: Bool) {
+        start()
+        updaterController.updater.automaticallyChecksForUpdates = isEnabled
+        automaticallyChecksForUpdates = isEnabled
         DiagnosticLogStore.shared.log(
             .info,
             category: "update",
-            "github-release-manifest-succeeded tag=\(release.tagName)"
+            "automatic-update-checks-changed enabled=\(isEnabled)"
         )
-        return release
-    }
-
-    private var currentVersion: String {
-        Bundle.main.object(
-            forInfoDictionaryKey: "CFBundleShortVersionString"
-        ) as? String ?? "0.0.0"
-    }
-
-    private func showResult(for release: GitHubRelease) {
-        let latestVersion = release.tagName.trimmingCharacters(
-            in: CharacterSet(charactersIn: "vV")
-        )
-        if ReleaseVersion(currentVersion) < ReleaseVersion(latestVersion) {
-            let alert = NSAlert()
-            alert.alertStyle = .informational
-            alert.messageText = "发现新版本 \(latestVersion)"
-            alert.informativeText = release.name.map {
-                "当前版本：\(currentVersion)\n最新版本：\($0)"
-            } ?? "当前版本：\(currentVersion)"
-            alert.addButton(withTitle: "打开下载页面")
-            alert.addButton(withTitle: "稍后")
-            NSApp.activate(ignoringOtherApps: true)
-            if alert.runModal() == .alertFirstButtonReturn {
-                NSWorkspace.shared.open(release.htmlURL)
-            }
-            return
-        }
-
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = "已经是最新版本"
-        alert.informativeText = "当前版本：\(currentVersion)"
-        alert.addButton(withTitle: "好")
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
-    }
-
-    private func showNoPublishedReleaseAlert() {
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = "暂时没有可用更新"
-        alert.informativeText = "GitHub Releases 中还没有正式发布版本。"
-        alert.addButton(withTitle: "好")
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
-    }
-
-    private func showFailureAlert(_ error: Error) {
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "检查更新失败"
-        alert.informativeText = error.localizedDescription
-        alert.addButton(withTitle: "好")
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
-    }
-
-    private enum UpdateError: LocalizedError {
-        case invalidResponse
-        case httpStatus(Int)
-
-        var errorDescription: String? {
-            switch self {
-            case .invalidResponse:
-                "更新服务器返回了无效响应。"
-            case let .httpStatus(statusCode):
-                "更新服务器返回错误（HTTP \(statusCode)）。"
-            }
-        }
     }
 }

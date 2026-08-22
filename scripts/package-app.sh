@@ -17,8 +17,9 @@ if pgrep -x MImago >/dev/null; then
   done
 fi
 rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources" "$APP_DIR/Contents/Frameworks"
 cp "$BUILD_DIR/MImago" "$APP_DIR/Contents/MacOS/MImago"
+cp -R "$BUILD_DIR/Sparkle.framework" "$APP_DIR/Contents/Frameworks/"
 cp -R "$BUILD_DIR/MImago_MImago.bundle" "$APP_DIR/"
 cp -R "$BUILD_DIR/FormaUI_FormaUI.bundle" "$APP_DIR/"
 cp "$PROJECT_DIR/BrandAssets/AppIcon/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
@@ -36,7 +37,6 @@ codesign \
   --force \
   --deep \
   --sign "$SIGNING_IDENTITY" \
-  --identifier "$BUNDLE_IDENTIFIER" \
   --timestamp=none \
   --no-strict \
   "$APP_DIR"
