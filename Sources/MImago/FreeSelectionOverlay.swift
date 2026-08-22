@@ -265,6 +265,14 @@ private final class FrozenDisplayImageView: NSView {
         activatedWindowLayer.contentsScale = backingScaleFactor
         activatedWindowLayer.magnificationFilter = .linear
         activatedWindowLayer.minificationFilter = .linear
+        activatedWindowLayer.actions = [
+            "bounds": NSNull(),
+            "position": NSNull(),
+            "contents": NSNull(),
+            "contentsScale": NSNull(),
+            "hidden": NSNull(),
+            "opacity": NSNull()
+        ]
         activatedWindowLayer.isHidden = true
         layer?.addSublayer(activatedWindowLayer)
     }
@@ -281,6 +289,8 @@ private final class FrozenDisplayImageView: NSView {
     }
 
     func showActivatedWindow(_ image: CGImage, in topLeftFrame: CGRect) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         activatedWindowLayer.contents = image
         activatedWindowLayer.contentsScale = captureBackingScaleFactor
         activatedWindowLayer.frame = CGRect(
@@ -290,6 +300,7 @@ private final class FrozenDisplayImageView: NSView {
             height: topLeftFrame.height
         )
         activatedWindowLayer.isHidden = false
+        CATransaction.commit()
     }
 }
 
