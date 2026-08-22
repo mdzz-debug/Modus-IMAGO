@@ -835,6 +835,9 @@ private struct FreeSelectionOverlayView: View {
     @State private var recordingCountdownValue: Int?
     @State private var recordingCountdownTask: Task<Void, Never>?
     @State private var longScreenshotSession: CaptureController.ManualLongScreenshotSession?
+    @State private var longScreenshotScrollTarget: CaptureController.ManualLongScreenshotScrollTarget?
+    @State private var isCheckingLongScreenshotAvailability = false
+    @State private var longScreenshotAvailabilityTask: Task<Void, Never>?
 
     init(
         purpose: CaptureOverlayPurpose,
@@ -984,6 +987,9 @@ private struct FreeSelectionOverlayView: View {
         .onChange(of: textColor) { _, _ in updateEditingTextStyle() }
         .onChange(of: textBackground) { _, _ in updateEditingTextStyle() }
         .onChange(of: textSize) { _, _ in updateEditingTextStyle() }
+        .onChange(of: confirmedSelection) { _, selection in
+            refreshLongScreenshotAvailability(for: selection)
+        }
         .onChange(of: session.selectedDisplayID) { _, selectedDisplayID in
             guard let selectedDisplayID, selectedDisplayID != displayID else { return }
             hoveredWindow = nil
@@ -999,6 +1005,8 @@ private struct FreeSelectionOverlayView: View {
         .onDisappear {
             recordingCountdownTask?.cancel()
             recordingCountdownTask = nil
+            longScreenshotAvailabilityTask?.cancel()
+            longScreenshotAvailabilityTask = nil
             longScreenshotSession?.stop()
             FreeSelectionOverlay.dismissLongScreenshotPreview(on: displayID)
             NSCursor.arrow.set()
@@ -1310,8 +1318,9 @@ private struct FreeSelectionOverlayView: View {
             actionButton(
                 "rectangle.expand.vertical",
                 label: "截长图",
-                help: "窗口或自由选区都可进入；向下滚动并在角落预览拼接结果",
-                role: .secondary
+                help: longScreenshotHelp,
+                role: .secondary,
+                isEnabled: longScreenshotScrollTarget != nil
             ) {
                 beginLongScreenshot(in: bounds)
             }
@@ -2415,7 +2424,8 @@ private struct FreeSelectionOverlayView: View {
     private func beginLongScreenshot(in bounds: CGRect) {
         guard purpose == .screenshot,
               longScreenshotSession == nil,
-              let confirmedSelection else { return }
+              let confirmedSelection,
+              let longScreenshotScrollTarget else { return }
 
         if textDraftPosition != nil {
             commitTextDraft()
@@ -2426,21 +2436,28 @@ private struct FreeSelectionOverlayView: View {
         hoveredAnnotationID = nil
         annotationDraft = nil
 
-        let source: CaptureController.ManualLongScreenshotSource
-        switch confirmedSelection {
-        case let .window(candidate):
-            source = .window(windowID: candidate.windowID, processID: candidate.processID)
-        case let .region(rect):
-            source = .region(
-                displayID: displayID,
-                normalizedRect: CGRect(
-                    x: rect.minX / bounds.width,
-                    y: rect.minY / bounds.height,
-                    width: rect.width / bounds.width,
-                    height: rect.height / bounds.height
-                )
-            )
-        }
+        guard let targetCandidate = windowCandidates.first(where: {
+            $0.windowID == longScreenshotScrollTarget.windowID
+                && $0.processID == longScreenshotScrollTarget.processID
+        }) else { return }
+        let scrollFrame = longScreenshotScrollTarget.selectionFrame.offsetBy(
+            dx: targetCandidate.frame.minX,
+            dy: targetCandidate.frame.minY
+        )
+        let captureRect = confirmedSelection.frame.intersection(scrollFrame)
+        guard !captureRect.isNull,
+              captureRect.width >= 40,
+              captureRect.height >= 40 else { return }
+        let source = CaptureController.ManualLongScreenshotSource.region(
+            displayID: displayID,
+            normalizedRect: CGRect(
+                x: captureRect.minX / bounds.width,
+                y: captureRect.minY / bounds.height,
+                width: captureRect.width / bounds.width,
+                height: captureRect.height / bounds.height
+            ),
+            scrollTarget: longScreenshotScrollTarget
+        )
 
         let captureSession = CaptureController.ManualLongScreenshotSession(
             source: source
@@ -2465,6 +2482,84 @@ private struct FreeSelectionOverlayView: View {
         longScreenshotSession = nil
         FreeSelectionOverlay.dismissLongScreenshotPreview(on: displayID)
         updateCursor()
+    }
+
+    private var longScreenshotHelp: String {
+        if isCheckingLongScreenshotAvailability {
+            return "正在检查选区内是否有可滚动内容"
+        }
+        if longScreenshotScrollTarget == nil {
+            return "当前选区内未识别到可滚动内容，请框选聊天记录、网页正文或列表区域"
+        }
+        return "在选区内向下滚动，角落预览会持续拼接新增内容"
+    }
+
+    private func refreshLongScreenshotAvailability(
+        for selection: ConfirmedOverlaySelection?
+    ) {
+        longScreenshotAvailabilityTask?.cancel()
+        longScreenshotAvailabilityTask = nil
+        longScreenshotScrollTarget = nil
+        isCheckingLongScreenshotAvailability = false
+
+        guard purpose == .screenshot,
+              let selection else { return }
+
+        let candidates: [(CaptureWindowCandidate, CGRect)]
+        switch selection {
+        case let .window(candidate):
+            candidates = [(
+                candidate,
+                CGRect(origin: .zero, size: candidate.frame.size)
+            )]
+        case let .region(rect):
+            candidates = windowCandidates.compactMap { candidate in
+                let overlap = candidate.frame.intersection(rect)
+                guard !overlap.isNull,
+                      overlap.width >= 60,
+                      overlap.height >= 60 else { return nil }
+                return (
+                    candidate,
+                    CGRect(
+                        x: overlap.minX - candidate.frame.minX,
+                        y: overlap.minY - candidate.frame.minY,
+                        width: overlap.width,
+                        height: overlap.height
+                    )
+                )
+            }
+            .sorted { lhs, rhs in
+                lhs.1.width * lhs.1.height > rhs.1.width * rhs.1.height
+            }
+        }
+        guard !candidates.isEmpty else { return }
+
+        isCheckingLongScreenshotAvailability = true
+        longScreenshotAvailabilityTask = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .milliseconds(110))
+            } catch {
+                return
+            }
+            let resolved = await Task.detached(
+                priority: .userInitiated
+            ) { () -> CaptureController.ManualLongScreenshotScrollTarget? in
+                for (candidate, selectionFrame) in candidates {
+                    if let target = CaptureController.manualLongScreenshotTarget(
+                        windowID: candidate.windowID,
+                        processID: candidate.processID,
+                        selectionFrame: selectionFrame
+                    ) {
+                        return target
+                    }
+                }
+                return nil
+            }.value
+            guard !Task.isCancelled else { return }
+            longScreenshotScrollTarget = resolved
+            isCheckingLongScreenshotAvailability = false
+            longScreenshotAvailabilityTask = nil
+        }
     }
 
     private func finishLongScreenshot() {

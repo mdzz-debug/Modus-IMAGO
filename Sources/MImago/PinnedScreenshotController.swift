@@ -309,7 +309,8 @@ private final class PinnedScreenshotControlsHostingView: NSHostingView<AnyView> 
 }
 
 private final class PinnedScreenshotContentView: NSView {
-    private static let controlsSize = CGSize(width: 204, height: 62)
+    private static let controlsSize = CGSize(width: 196, height: 44)
+    private static let controlsRightInset: CGFloat = 12
 
     private let backgroundLayer = CALayer()
     private let imageLayer = CALayer()
@@ -366,7 +367,7 @@ private final class PinnedScreenshotContentView: NSView {
             }
         )
         hostingView.frame = CGRect(
-            x: max(0, size.width - Self.controlsSize.width),
+            x: max(0, size.width - Self.controlsSize.width - Self.controlsRightInset),
             y: max(0, size.height - Self.controlsSize.height),
             width: Self.controlsSize.width,
             height: Self.controlsSize.height
@@ -410,7 +411,7 @@ private final class PinnedScreenshotContentView: NSView {
         )
         zoomTextLayer.frame = CGRect(x: 0, y: 6, width: 72, height: 18)
         hostingView.frame.origin = CGPoint(
-            x: max(0, bounds.width - Self.controlsSize.width),
+            x: max(0, bounds.width - Self.controlsSize.width - Self.controlsRightInset),
             y: max(0, bounds.height - Self.controlsSize.height)
         )
         CATransaction.commit()
@@ -481,31 +482,26 @@ private struct PinnedScreenshotControlsView: View {
     @State private var screenshotOpacity = 1.0
 
     var body: some View {
-        ZStack {
-            VStack {
-                HStack(spacing: 8) {
-                    Spacer()
-                    opacityControl
-                    FormaButton(
-                        "",
-                        systemImage: "xmark",
-                        role: .secondary,
-                        size: .small,
-                        depth: .raised,
-                        action: onClose
-                    )
-                    .frame(width: 38)
-                    .accessibilityLabel("关闭置顶截图")
-                    .delayedFormaHelp(
-                        "关闭置顶截图",
-                        detail: "关闭当前这张置顶图片",
-                        placement: .below
-                    )
-                }
-                .padding(8)
-                Spacer()
-            }
+        HStack(spacing: 6) {
+            opacityControl
+            FormaButton(
+                "",
+                systemImage: "xmark",
+                role: .secondary,
+                size: .small,
+                depth: .raised,
+                action: onClose
+            )
+            .frame(width: 32)
+            .accessibilityLabel("关闭置顶截图")
+            .delayedFormaHelp(
+                "关闭置顶截图",
+                detail: "关闭当前这张置顶图片",
+                placement: .below
+            )
         }
+        .padding(.horizontal, 5)
+        .padding(.vertical, 4)
         .background(Color.clear)
         .onAppear { onOpacityChange(screenshotOpacity) }
         .onChange(of: screenshotOpacity) { _, opacity in
@@ -514,18 +510,118 @@ private struct PinnedScreenshotControlsView: View {
     }
 
     private var opacityControl: some View {
-        FormaSlider(
-            "透明度",
-            value: $screenshotOpacity,
-            range: 0.15...1,
-            step: 0.05,
-            formatter: { "\(Int(($0 * 100).rounded()))%" }
-        )
-        .frame(width: 142, height: 48)
+        HStack(spacing: 5) {
+            Image(systemName: "circle.lefthalf.filled")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(FormaColor.inkSoft)
+                .accessibilityHidden(true)
+            PinnedOpacitySlider(
+                value: $screenshotOpacity,
+                range: 0.15...1,
+                step: 0.05
+            )
+            .frame(width: 91, height: 24)
+            Text("\(Int((screenshotOpacity * 100).rounded()))%")
+                .font(.formaLabel(9))
+                .monospacedDigit()
+                .foregroundStyle(FormaTheme.accent)
+                .frame(width: 31, alignment: .trailing)
+        }
+        .frame(width: 148, height: 30)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("透明度")
+        .accessibilityValue("\(Int((screenshotOpacity * 100).rounded()))%")
         .delayedFormaHelp(
             "透明度",
             detail: "拖动滑条调整截图透明度，控制按钮保持清晰",
             placement: .below
         )
+    }
+}
+
+private struct PinnedOpacitySlider: View {
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+
+    @EnvironmentObject private var sounds: SoundCenter
+    @State private var previousStep: Double?
+
+    var body: some View {
+        GeometryReader { proxy in
+            let thumbSize: CGFloat = 16
+            let usableWidth = max(1, proxy.size.width - thumbSize)
+            let fraction = normalizedValue
+            let thumbX = thumbSize / 2 + usableWidth * fraction
+
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(FormaColor.line.opacity(0.72))
+                    .frame(width: usableWidth, height: 4)
+                    .offset(x: thumbSize / 2)
+                Capsule()
+                    .fill(FormaTheme.accent)
+                    .frame(width: max(4, usableWidth * fraction), height: 4)
+                    .offset(x: thumbSize / 2)
+                Circle()
+                    .fill(FormaTheme.surface)
+                    .frame(width: thumbSize, height: thumbSize)
+                    .overlay {
+                        Circle().stroke(FormaTheme.accent, lineWidth: 2)
+                    }
+                    .shadow(color: FormaTheme.shadow, radius: 2, y: 1)
+                    .position(x: thumbX, y: proxy.size.height / 2)
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { gesture in
+                        updateValue(at: gesture.location.x, width: proxy.size.width)
+                    }
+                    .onEnded { _ in
+                        previousStep = nil
+                        sounds.play(.sliderCommit, intensity: 0.85)
+                    }
+            )
+        }
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment:
+                setValue(value + step)
+            case .decrement:
+                setValue(value - step)
+            @unknown default:
+                break
+            }
+        }
+    }
+
+    private var normalizedValue: CGFloat {
+        let span = range.upperBound - range.lowerBound
+        guard span > 0 else { return 0 }
+        return CGFloat(min(1, max(0, (value - range.lowerBound) / span)))
+    }
+
+    private func updateValue(at x: CGFloat, width: CGFloat) {
+        let thumbSize: CGFloat = 16
+        let usableWidth = max(1, width - thumbSize)
+        let localX = min(usableWidth, max(0, x - thumbSize / 2))
+        let fraction = Double(localX / usableWidth)
+        setValue(range.lowerBound + fraction * (range.upperBound - range.lowerBound))
+    }
+
+    private func setValue(_ proposedValue: Double) {
+        let clamped = min(range.upperBound, max(range.lowerBound, proposedValue))
+        let steps = ((clamped - range.lowerBound) / step).rounded()
+        let snapped = min(
+            range.upperBound,
+            max(range.lowerBound, range.lowerBound + steps * step)
+        )
+        guard snapped != value else { return }
+        value = snapped
+        if previousStep != snapped {
+            sounds.play(.sliderTick, intensity: 0.55)
+            previousStep = snapped
+        }
     }
 }

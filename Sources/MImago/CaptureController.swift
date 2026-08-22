@@ -221,7 +221,17 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
 
     enum ManualLongScreenshotSource: Sendable {
         case window(windowID: CGWindowID, processID: pid_t)
-        case region(displayID: CGDirectDisplayID, normalizedRect: CGRect)
+        case region(
+            displayID: CGDirectDisplayID,
+            normalizedRect: CGRect,
+            scrollTarget: ManualLongScreenshotScrollTarget
+        )
+    }
+
+    struct ManualLongScreenshotScrollTarget: Sendable, Hashable {
+        let windowID: CGWindowID
+        let processID: pid_t
+        let selectionFrame: CGRect
     }
 
     @MainActor
@@ -239,6 +249,11 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         private nonisolated let frameProcessor = LongScreenshotFrameProcessor()
         private var stream: SCStream?
         private var isStopped = false
+        private var globalScrollMonitor: Any?
+        private var localScrollMonitor: Any?
+        private var scrollCaptureTask: Task<Void, Never>?
+        private var snapshotPollingTask: Task<Void, Never>?
+        private var isSnapshotCaptureInFlight = false
 
         init(source: ManualLongScreenshotSource) {
             self.source = source
@@ -256,6 +271,8 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 do {
+                    CaptureController.prepareManualLongScreenshotSource(source)
+                    try await Task.sleep(for: .milliseconds(120))
                     let (filter, configuration) = try await CaptureController.longScreenshotStreamConfiguration(
                         source: source
                     )
@@ -277,6 +294,9 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
                         try? await stream.stopCapture()
                         return
                     }
+                    installScrollMonitors()
+                    scheduleSnapshotCapture(after: .milliseconds(60))
+                    startSnapshotPolling()
                     DiagnosticLogStore.shared.log(
                         .info,
                         category: "long-screenshot",
@@ -297,6 +317,18 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         func stop() {
             isStopped = true
             isCapturing = false
+            scrollCaptureTask?.cancel()
+            scrollCaptureTask = nil
+            snapshotPollingTask?.cancel()
+            snapshotPollingTask = nil
+            if let globalScrollMonitor {
+                NSEvent.removeMonitor(globalScrollMonitor)
+                self.globalScrollMonitor = nil
+            }
+            if let localScrollMonitor {
+                NSEvent.removeMonitor(localScrollMonitor)
+                self.localScrollMonitor = nil
+            }
             let activeStream = stream
             stream = nil
             if let activeStream {
@@ -337,6 +369,11 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
             ) == noErr,
                   let image else { return }
 
+            processCapturedImage(image)
+        }
+
+        nonisolated private func processCapturedImage(_ image: CGImage) {
+
             do {
                 guard let update = try frameProcessor.consume(image) else { return }
                 Task { @MainActor [weak self] in
@@ -346,6 +383,75 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
                 Task { @MainActor [weak self] in
                     self?.reportFrameError(error)
                 }
+            }
+        }
+
+        private func installScrollMonitors() {
+            guard globalScrollMonitor == nil,
+                  localScrollMonitor == nil else { return }
+
+            globalScrollMonitor = NSEvent.addGlobalMonitorForEvents(
+                matching: .scrollWheel
+            ) { [weak self] event in
+                guard abs(event.scrollingDeltaY) > 0.01 else { return }
+                Task { @MainActor [weak self] in
+                    self?.scheduleSnapshotCapture(after: .milliseconds(95))
+                }
+            }
+            localScrollMonitor = NSEvent.addLocalMonitorForEvents(
+                matching: .scrollWheel
+            ) { [weak self] event in
+                if abs(event.scrollingDeltaY) > 0.01 {
+                    Task { @MainActor [weak self] in
+                        self?.scheduleSnapshotCapture(after: .milliseconds(95))
+                    }
+                }
+                return event
+            }
+        }
+
+        private func scheduleSnapshotCapture(after delay: Duration) {
+            guard !isStopped else { return }
+            scrollCaptureTask?.cancel()
+            scrollCaptureTask = Task { @MainActor [weak self] in
+                do {
+                    try await Task.sleep(for: delay)
+                } catch {
+                    return
+                }
+                await self?.captureSnapshotAfterScroll()
+            }
+        }
+
+        private func startSnapshotPolling() {
+            snapshotPollingTask?.cancel()
+            snapshotPollingTask = Task { @MainActor [weak self] in
+                while let self, !Task.isCancelled, !self.isStopped {
+                    do {
+                        try await Task.sleep(for: .milliseconds(320))
+                    } catch {
+                        return
+                    }
+                    await self.captureSnapshotAfterScroll()
+                }
+            }
+        }
+
+        private func captureSnapshotAfterScroll() async {
+            guard !isStopped,
+                  !isSnapshotCaptureInFlight else { return }
+            isSnapshotCaptureInFlight = true
+            defer { isSnapshotCaptureInFlight = false }
+
+            do {
+                let image = try await CaptureController.captureManualLongScreenshotFrame(
+                    source: source
+                )
+                frameQueue.async { [weak self] in
+                    self?.processCapturedImage(image)
+                }
+            } catch {
+                reportFrameError(error)
             }
         }
 
@@ -390,8 +496,8 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
             switch source {
             case let .window(windowID, processID):
                 "window=\(windowID) pid=\(processID)"
-            case let .region(displayID, normalizedRect):
-                "region display=\(displayID) rect=\(normalizedRect.debugDescription)"
+            case let .region(displayID, normalizedRect, scrollTarget):
+                "region display=\(displayID) rect=\(normalizedRect.debugDescription) target=\(scrollTarget.windowID) pid=\(scrollTarget.processID)"
             }
         }
     }
@@ -800,6 +906,74 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         return (filter, configuration)
     }
 
+    nonisolated static func manualLongScreenshotTarget(
+        windowID: CGWindowID,
+        processID: pid_t,
+        selectionFrame: CGRect
+    ) -> ManualLongScreenshotScrollTarget? {
+        guard selectionFrame.width >= 40,
+              selectionFrame.height >= 40,
+              AXIsProcessTrusted(),
+              let targetWindowFrame = windowFrame(windowID: windowID),
+              let windowElement = accessibilityWindow(
+                windowID: windowID,
+                processID: processID
+              ),
+              let scrollFrame = scrollableFrame(
+                in: windowElement,
+                intersecting: selectionFrame.offsetBy(
+                    dx: targetWindowFrame.minX,
+                    dy: targetWindowFrame.minY
+                )
+              ) else {
+            return nil
+        }
+        return ManualLongScreenshotScrollTarget(
+            windowID: windowID,
+            processID: processID,
+            selectionFrame: scrollFrame.offsetBy(
+                dx: -targetWindowFrame.minX,
+                dy: -targetWindowFrame.minY
+            )
+        )
+    }
+
+    nonisolated private static func prepareManualLongScreenshotSource(
+        _ source: ManualLongScreenshotSource
+    ) {
+        let target: ManualLongScreenshotScrollTarget
+        switch source {
+        case let .window(windowID, processID):
+            guard let windowFrame = windowFrame(windowID: windowID) else { return }
+            target = ManualLongScreenshotScrollTarget(
+                windowID: windowID,
+                processID: processID,
+                selectionFrame: CGRect(origin: .zero, size: windowFrame.size)
+            )
+        case let .region(_, _, scrollTarget):
+            target = scrollTarget
+        }
+
+        raiseWindow(windowID: target.windowID, processID: target.processID)
+        movePointerIntoScrollSelection(target)
+    }
+
+    nonisolated private static func movePointerIntoScrollSelection(
+        _ target: ManualLongScreenshotScrollTarget
+    ) {
+        guard let windowFrame = windowFrame(windowID: target.windowID) else { return }
+        let selection = target.selectionFrame.standardized.intersection(
+            CGRect(origin: .zero, size: windowFrame.size)
+        )
+        guard !selection.isNull, selection.width > 0, selection.height > 0 else { return }
+        CGWarpMouseCursorPosition(
+            CGPoint(
+                x: windowFrame.minX + selection.midX,
+                y: windowFrame.minY + selection.midY
+            )
+        )
+    }
+
     nonisolated private static func recordingOutputSize(
         _ source: CGSize,
         quality: RecordingQuality
@@ -939,7 +1113,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
             configuration.ignoreShadowsSingleWindow = true
             filter = SCContentFilter(desktopIndependentWindow: window)
 
-        case let .region(displayID, normalizedRect):
+        case let .region(displayID, normalizedRect, _):
             guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
                 throw CaptureError.noDisplayAvailable
             }
@@ -979,6 +1153,18 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         configuration.showsCursor = false
         configuration.capturesAudio = false
         return (filter, configuration)
+    }
+
+    nonisolated private static func captureManualLongScreenshotFrame(
+        source: ManualLongScreenshotSource
+    ) async throws -> CGImage {
+        let (filter, configuration) = try await longScreenshotStreamConfiguration(
+            source: source
+        )
+        return try await SCScreenshotManager.captureImage(
+            contentFilter: filter,
+            configuration: configuration
+        )
     }
 
     private static func windowCandidates(for screen: NSScreen) -> [CaptureWindowCandidate] {
@@ -1238,7 +1424,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         return try stitchVerticalFrames(frames)
     }
 
-    private static func accessibilityWindow(
+    nonisolated private static func accessibilityWindow(
         windowID: CGWindowID,
         processID: pid_t
     ) -> AXUIElement? {
@@ -1266,6 +1452,82 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
             let hasMatchingTitle = targetTitle.map { axWindowTitle(window) == $0 } == true
             return hasMatchingWindowNumber || hasMatchingFrame || hasMatchingTitle
         }
+    }
+
+    nonisolated private static func scrollableFrame(
+        in root: AXUIElement,
+        intersecting selectionFrame: CGRect
+    ) -> CGRect? {
+        var best: CGRect?
+
+        func visit(_ element: AXUIElement, depth: Int) {
+            guard depth < 18 else { return }
+
+            var rawRole: CFTypeRef?
+            let role = AXUIElementCopyAttributeValue(
+                element,
+                kAXRoleAttribute as CFString,
+                &rawRole
+            ) == .success ? rawRole as? String : nil
+
+            var rawScrollBar: CFTypeRef?
+            let copiedScrollBar = AXUIElementCopyAttributeValue(
+                element,
+                kAXVerticalScrollBarAttribute as CFString,
+                &rawScrollBar
+            ) == .success
+            var hasScrollableRange = false
+            if copiedScrollBar,
+               let rawScrollBar,
+               CFGetTypeID(rawScrollBar) == AXUIElementGetTypeID() {
+                let scrollBar = unsafeDowncast(rawScrollBar, to: AXUIElement.self)
+                let minimum = accessibilityNumber(
+                    scrollBar,
+                    attribute: kAXMinValueAttribute
+                ) ?? 0
+                let maximum = accessibilityNumber(
+                    scrollBar,
+                    attribute: kAXMaxValueAttribute
+                ) ?? 0
+                hasScrollableRange = maximum - minimum > 0.0001
+            }
+
+            var actionNames: CFArray?
+            let supportsScrollAction = AXUIElementCopyActionNames(
+                element,
+                &actionNames
+            ) == .success && (actionNames as? [String])?.contains(where: {
+                $0.localizedCaseInsensitiveContains("scroll")
+            }) == true
+
+            if (role == kAXScrollAreaRole || copiedScrollBar),
+               hasScrollableRange || supportsScrollAction {
+                let frame = axWindowFrame(element).standardized
+                let overlap = frame.intersection(selectionFrame.standardized)
+                if !overlap.isNull,
+                   overlap.width >= 60,
+                   overlap.height >= 60,
+                   overlap.area >= min(3_600, selectionFrame.area * 0.18) {
+                    if overlap.area > (best?.area ?? 0) {
+                        best = overlap
+                    }
+                }
+            }
+
+            var rawChildren: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(
+                element,
+                kAXChildrenAttribute as CFString,
+                &rawChildren
+            ) == .success,
+                  let children = rawChildren as? [AXUIElement] else { return }
+            for child in children {
+                visit(child, depth: depth + 1)
+            }
+        }
+
+        visit(root, depth: 0)
+        return best
     }
 
     private static func largestScrollableArea(
@@ -1363,7 +1625,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         return best
     }
 
-    private static func accessibilityNumber(
+    nonisolated private static func accessibilityNumber(
         _ element: AXUIElement,
         attribute: String
     ) -> Double? {
@@ -1528,21 +1790,30 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
             height: sampleHeight
         )
 
-        let horizontalInset = max(3, sampleWidth / 28)
+        let horizontalInset = max(3, sampleWidth / 32)
         let topInset = max(4, sampleHeight / 12)
-        let bottomInset = max(4, sampleHeight / 20)
+        let bottomInset = max(4, sampleHeight / 10)
         let xStep = max(2, sampleWidth / 72)
         let yStep = max(2, sampleHeight / 96)
 
-        func score(for shift: Int) -> Double {
+        func score(
+            for shift: Int,
+            from startX: Int,
+            to endX: Int
+        ) -> (difference: Double, texturedSamples: Int, totalSamples: Int) {
             let endY = sampleHeight - bottomInset - shift
-            guard endY - topInset >= 12 else { return .greatestFiniteMagnitude }
+            guard endY - topInset >= 12,
+                  endX - startX >= xStep * 2 else {
+                return (.greatestFiniteMagnitude, 0, 0)
+            }
             var difference: UInt64 = 0
             var weightedSamples: UInt64 = 0
+            var texturedSamples = 0
+            var totalSamples = 0
             var y = topInset
             while y < endY {
-                var x = horizontalInset
-                while x < sampleWidth - horizontalInset - xStep {
+                var x = startX
+                while x < endX - xStep {
                     let previousIndex = ((y + shift) * sampleWidth + x) * 4
                     let nextIndex = (y * sampleWidth + x) * 4
                     let previousNeighbor = previousIndex + xStep * 4
@@ -1555,6 +1826,8 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
                         abs(Int(nextPixels[nextIndex + 1]) - Int(nextPixels[nextNeighbor + 1])) +
                         abs(Int(nextPixels[nextIndex + 2]) - Int(nextPixels[nextNeighbor + 2]))
                     let weight = detail >= 18 ? 4 : 1
+                    if detail >= 18 { texturedSamples += 1 }
+                    totalSamples += 1
                     difference += UInt64(weight * (
                         abs(Int(previousPixels[previousIndex]) - Int(nextPixels[nextIndex])) +
                         abs(Int(previousPixels[previousIndex + 1]) - Int(nextPixels[nextIndex + 1])) +
@@ -1565,12 +1838,15 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
                 }
                 y += yStep
             }
-            guard weightedSamples > 0 else { return .greatestFiniteMagnitude }
-            return Double(difference) / Double(weightedSamples)
+            guard weightedSamples > 0 else {
+                return (.greatestFiniteMagnitude, 0, totalSamples)
+            }
+            return (
+                Double(difference) / Double(weightedSamples),
+                texturedSamples,
+                totalSamples
+            )
         }
-
-        let samePositionScore = score(for: 0)
-        if samePositionScore < 0.8 { return 0 }
 
         let minimumShift = max(1, sampleHeight / 180)
         let maximumShift = max(
@@ -1580,22 +1856,72 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
                 Int(CGFloat(sampleHeight) * 0.82)
             )
         )
-        var bestShift = 0
-        var bestScore = Double.greatestFiniteMagnitude
-        for shift in minimumShift...maximumShift {
-            let candidateScore = score(for: shift)
-            if candidateScore < bestScore {
-                bestScore = candidateScore
-                bestShift = shift
+
+        // Desktop chat and browser windows often keep a sidebar, header, or
+        // composer fixed while only the central content column moves. Scoring
+        // the complete width lets those stationary pixels drown out the real
+        // scroll. Evaluate several overlapping vertical bands and trust the
+        // strongest textured band instead.
+        let usableStartX = horizontalInset
+        let usableEndX = sampleWidth - horizontalInset
+        let usableWidth = max(1, usableEndX - usableStartX)
+        let bandWidth = min(
+            usableWidth,
+            max(xStep * 6, Int((Double(usableWidth) * 0.46).rounded()))
+        )
+        let remainingWidth = max(0, usableWidth - bandWidth)
+        let bandStarts = (0..<4).map { index in
+            usableStartX + Int(
+                (Double(remainingWidth) * Double(index) / 3).rounded()
+            )
+        }
+
+        var strongestShift = 0
+        var strongestConfidence = -Double.greatestFiniteMagnitude
+        for bandStart in bandStarts {
+            let bandEnd = min(usableEndX, bandStart + bandWidth)
+            let samePosition = score(
+                for: 0,
+                from: bandStart,
+                to: bandEnd
+            )
+            guard samePosition.difference >= 0.8,
+                  samePosition.texturedSamples >= max(8, samePosition.totalSamples / 40) else {
+                continue
+            }
+
+            var bestShift = 0
+            var bestScore = Double.greatestFiniteMagnitude
+            for shift in minimumShift...maximumShift {
+                let candidate = score(
+                    for: shift,
+                    from: bandStart,
+                    to: bandEnd
+                )
+                if candidate.difference < bestScore {
+                    bestScore = candidate.difference
+                    bestShift = shift
+                }
+            }
+
+            guard bestShift > 0,
+                  bestScore < 24,
+                  bestScore + 0.35 < samePosition.difference
+                    || bestScore < samePosition.difference * 0.82 else {
+                continue
+            }
+            let ratio = bestScore / max(0.001, samePosition.difference)
+            let confidence = (samePosition.difference - bestScore)
+                + max(0, 1 - ratio) * 10
+                + min(4, Double(samePosition.texturedSamples) / 120)
+            if confidence > strongestConfidence {
+                strongestConfidence = confidence
+                strongestShift = bestShift
             }
         }
 
-        guard bestShift > 0,
-              bestScore < 22,
-              bestScore + 0.35 < samePositionScore || bestScore < samePositionScore * 0.82 else {
-            return 0
-        }
-        return max(1, Int((CGFloat(bestShift) / scale).rounded()))
+        guard strongestShift > 0 else { return 0 }
+        return max(1, Int((CGFloat(strongestShift) / scale).rounded()))
     }
 
     nonisolated private static func topDownRGBABytes(
@@ -1622,7 +1948,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         return bytes
     }
 
-    private static func raiseWindow(windowID: CGWindowID, processID: pid_t) {
+    nonisolated private static func raiseWindow(windowID: CGWindowID, processID: pid_t) {
         NSRunningApplication(processIdentifier: processID)?
             .activate(options: [.activateAllWindows])
 
@@ -1671,7 +1997,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         }
     }
 
-    private static func windowFrame(windowID: CGWindowID) -> CGRect? {
+    nonisolated private static func windowFrame(windowID: CGWindowID) -> CGRect? {
         guard let items = CGWindowListCopyWindowInfo(
             [.optionIncludingWindow],
             windowID
@@ -1680,7 +2006,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         return CGRect(dictionaryRepresentation: bounds)
     }
 
-    private static func windowTitle(windowID: CGWindowID) -> String? {
+    nonisolated private static func windowTitle(windowID: CGWindowID) -> String? {
         guard let items = CGWindowListCopyWindowInfo(
             [.optionIncludingWindow],
             windowID
@@ -1690,7 +2016,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         return title
     }
 
-    private static func axWindowTitle(_ window: AXUIElement) -> String? {
+    nonisolated private static func axWindowTitle(_ window: AXUIElement) -> String? {
         var rawTitle: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
             window,
@@ -1700,7 +2026,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         return rawTitle as? String
     }
 
-    private static func axWindowFrame(_ window: AXUIElement) -> CGRect {
+    nonisolated private static func axWindowFrame(_ window: AXUIElement) -> CGRect {
         var rawPosition: CFTypeRef?
         var rawSize: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
