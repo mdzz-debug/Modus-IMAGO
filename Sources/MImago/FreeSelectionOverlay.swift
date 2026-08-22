@@ -389,6 +389,7 @@ enum FreeSelectionOverlay {
         guard !screens.isEmpty else { return }
         cancelAction = onCancel
         let session = CaptureOverlaySession()
+        let hasFrozenSystemUI = !frozenImagesByDisplayID.isEmpty
         DiagnosticLogStore.shared.log(
             .info,
             category: "capture-overlay",
@@ -422,12 +423,14 @@ enum FreeSelectionOverlay {
             panel.isOpaque = false
             panel.backgroundColor = .clear
             panel.hasShadow = false
-            // The frozen frame already contains the Dock. Keep the capture
-            // surface above the live Dock so it cannot appear a second time
-            // or react to pointer hover during selection.
-            panel.level = NSWindow.Level(
-                rawValue: NSWindow.Level.screenSaver.rawValue + 2
-            )
+            // A frozen frame already contains the menu bar and Dock. Use the
+            // system shielding level for screenshots so their live windows
+            // stay completely behind the frozen surface and cannot react to
+            // pointer hover. Recording remains at screen-saver level because
+            // it intentionally presents live screen content.
+            panel.level = hasFrozenSystemUI
+                ? NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()) + 1)
+                : NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 2)
             panel.hidesOnDeactivate = false
             panel.isFloatingPanel = true
             panel.becomesKeyOnlyIfNeeded = false
@@ -556,7 +559,15 @@ enum FreeSelectionOverlay {
                 "overlay-remains-active-after-30-seconds panels=\(activePanels.count)"
             )
         }
-        suppressDockMagnification()
+        if hasFrozenSystemUI {
+            DiagnosticLogStore.shared.log(
+                .debug,
+                category: "capture-overlay",
+                "live-system-ui-shielded level=\(Int(CGShieldingWindowLevel()) + 1)"
+            )
+        } else {
+            suppressDockMagnification()
+        }
         for panel in activePanels.values where panel !== initialPanel {
             panel.orderFrontRegardless()
         }
@@ -608,7 +619,7 @@ enum FreeSelectionOverlay {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = false
-        panel.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 3)
+        panel.level = NSWindow.Level(rawValue: overlayPanel.level.rawValue + 1)
         panel.hidesOnDeactivate = false
         panel.isFloatingPanel = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]

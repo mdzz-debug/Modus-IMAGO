@@ -16,6 +16,7 @@
 - Retina 显示器的定格画面改为按真实背板像素捕获，文字和界面细节不再模糊。
 - 定格画面仍保留原有窗口识别、悬停高亮和单击选窗能力。
 - 修复定格帧中的 Dock 与实时 Dock 重叠显示的问题。
+- 定格完成后使用系统遮蔽层隐藏真实 Dock 和菜单栏，避免其继续响应悬停或点击。
 - 修复副显示器中的应用进入 macOS 原生全屏后无法选择该屏幕的问题。
 - 修复副屏点击穿透后截图会话无法结束的问题。
 - 修复选中窗口后 Esc 偶尔无法退出截图的问题，并增加不依赖窗口焦点的按键状态兜底监测。
@@ -24,7 +25,7 @@
 
 此版本用于验证从 0.1.1 到 0.1.2 的 Sparkle 应用内更新流程。
 ]]></description>
-            <enclosure url="https://github.com/mdzz-debug/Modus-IMAGO/releases/download/v0.1.2/M-Imago-v0.1.2-arm64.zip" length="5610309" type="application/octet-stream" sparkle:edSignature="qqxxdHhveetHTrUpcUvcOCEkkCLVNIJx44hSvB18Ux+3ZroG/Isoo/b0eB9D0O+YUSzHSL3BSJWZgbLxywuqDw=="/>
+            <enclosure url="https://github.com/mdzz-debug/Modus-IMAGO/releases/download/v0.1.2/M-Imago-v0.1.2-arm64.zip" length="5610718" type="application/octet-stream" sparkle:edSignature="MmI1bGB3qH49kZHGJj5NPpVG6vtBTgNtUSoYq8/bHrriaxy0qiSpLBMRouQt0q/xbRgSYbJi0hXLyQe0RsEiAg=="/>
         </item>
     </channel>
 </rss>
