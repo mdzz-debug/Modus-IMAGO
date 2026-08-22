@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$PROJECT_DIR/.build/arm64-apple-macosx/debug"
-APP_DIR="$PROJECT_DIR/.build/M-Imago.app"
+APP_DIR="$PROJECT_DIR/.build/M · Imago.app"
 BUNDLE_IDENTIFIER="com.modus.imago"
 SIGNING_IDENTITY="${M_IMAGO_SIGNING_IDENTITY:-Modus App Signing - $BUNDLE_IDENTIFIER}"
 

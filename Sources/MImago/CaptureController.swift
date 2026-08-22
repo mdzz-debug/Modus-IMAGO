@@ -92,7 +92,7 @@ final class MImagoPermissions {
         Task {
             guard Bundle.main.bundleURL.pathExtension == "app" else {
                 CaptureController.shared.setStatusMessage(
-                    "当前由 swift run 启动，无法使用已授予 M-Imago.app 的屏幕录制权限。请运行 zsh scripts/package-app.sh。"
+                    "当前由 swift run 启动，无法使用已授予 M · Imago.app 的屏幕录制权限。请运行 zsh scripts/package-app.sh。"
                 )
                 return
             }

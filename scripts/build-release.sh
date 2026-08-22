@@ -36,7 +36,7 @@ if [[ ! -f "$RELEASE_NOTES_PATH" ]]; then
 fi
 
 BUILD_ROOT="$PROJECT_DIR/.build/$ARCH-apple-macosx/release"
-APP_DIR="$PROJECT_DIR/.build/release/M-Imago.app"
+APP_DIR="$PROJECT_DIR/.build/release/M · Imago.app"
 DIST_DIR="$PROJECT_DIR/dist/v$VERSION"
 DMG_PATH="$DIST_DIR/M-Imago-v$VERSION-$ARCH.dmg"
 ZIP_PATH="$DIST_DIR/M-Imago-v$VERSION-$ARCH.zip"
@@ -90,6 +90,10 @@ cp "$RELEASE_NOTES_PATH" "$APPCAST_WORK_DIR/${ZIP_PATH:t:r}.md"
   --maximum-deltas 0 \
   -o "$APPCAST_PATH" \
   "$APPCAST_WORK_DIR"
+
+# generate_appcast derives the channel title from the URL-safe archive name.
+# Keep the technical filename stable while presenting the approved sub-brand name.
+/usr/bin/perl -0pi -e 's{<title>[^<]*</title>}{<title>M · Imago</title>}' "$APPCAST_PATH"
 cp "$APPCAST_PATH" "$PROJECT_DIR/updates/appcast.xml"
 
 (

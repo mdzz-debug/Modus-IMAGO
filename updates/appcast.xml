@@ -1,7 +1,7 @@
 <?xml version="1.0" standalone="yes"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
     <channel>
-        <title>M-Imago</title>
+        <title>M · Imago</title>
         <item>
             <title>0.1.1</title>
             <pubDate>Sat, 22 Aug 2026 15:44:08 +0800</pubDate>
@@ -20,7 +20,7 @@
 
 首次从 0.1.0 升级到 0.1.1 仍需手动安装；从 0.1.1 开始，后续版本可自动更新。
 ]]></description>
-            <enclosure url="https://github.com/mdzz-debug/Modus-IMAGO/releases/download/v0.1.1/M-Imago-v0.1.1-arm64.zip" length="5593280" type="application/octet-stream" sparkle:edSignature="Nz1OSAFGUEH0G7o5xRlsyAY+RYn9/mgapNqnj5y1riz5DwAZELgvLVY+OYQKyqGM5/0a0DkOJOQSmwYNnjxRDQ=="/>
+            <enclosure url="https://github.com/mdzz-debug/Modus-IMAGO/releases/download/v0.1.1/M-Imago-v0.1.1-arm64.zip" length="5596288" type="application/octet-stream" sparkle:edSignature="GXw9H1caXkg85Cssj2KCn0d7uuSTjKr6kq5r80KyN3f8Yz/vXXHGLfqtDADIAxwgOGg4lkep6nfDjcQyX9c7Bw=="/>
         </item>
     </channel>
 </rss>

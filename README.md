@@ -22,7 +22,7 @@ zsh scripts/package-app.sh
 打包结果位于：
 
 ```text
-.build/M-Imago.app
+.build/M · Imago.app
 ```
 
 ## 朋友版发布
