@@ -627,7 +627,6 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
     private var recordingOutput: SCRecordingOutput?
     private var recordingDurationTask: Task<Void, Never>?
     private var isStoppingRecording = false
-    private var windowsHiddenForCapture: [NSWindow] = []
     private var frozenDisplayImages: [CGDirectDisplayID: CGImage] = [:]
     private var isSelectionOverlayPresented = false
 
@@ -659,8 +658,19 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
     func takeFreeScreenshot(_ result: CaptureSelectionResult) {
         statusMessage = result.action == .longScreenshot ? "正在截取长图…" : "正在处理选区…"
         Task { [weak self] in
-            defer { self?.restoreWindowsHiddenForCapture() }
+            defer { self?.finishCaptureOverlaySession() }
             do {
+                if case let .window(windowID, processID) = result.target {
+                    // Frozen-window screenshots no longer pass through the
+                    // live window capture fallback, so explicitly restore the
+                    // original behavior of activating only the chosen window.
+                    Self.raiseWindow(windowID: windowID, processID: processID)
+                    DiagnosticLogStore.shared.log(
+                        .debug,
+                        category: "screenshot",
+                        "selected-window-raised id=\(windowID) pid=\(processID)"
+                    )
+                }
                 try await Task.sleep(for: .milliseconds(120))
 
                 if result.action == .longScreenshot {
@@ -691,7 +701,6 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
                 } else {
                     switch result.target {
                     case let .window(windowID, processID):
-                        Self.raiseWindow(windowID: windowID, processID: processID)
                         try await Task.sleep(for: .milliseconds(180))
                         captured = try await Self.captureWindowImage(
                             windowID: windowID,
@@ -735,7 +744,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         } catch {
             statusMessage = Self.captureFailureMessage(prefix: "长截图失败", error: error)
         }
-        restoreWindowsHiddenForCapture()
+        finishCaptureOverlaySession()
     }
 
     private func beginFreeScreenshot(initialPointerGlobalLocation: CGPoint) {
@@ -761,12 +770,6 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
             "selection-start displays=\(screens.count)"
         )
         AppDelegate.shared?.setCaptureOverlayActive(true)
-        // Hide every visible window owned by M · Imago before querying the
-        // WindowServer. FormaUI popovers and the floating thumbnail are
-        // panels too; leaving them visible makes them appear in a full-screen
-        // capture even though they are not valid window-selection targets.
-        windowsHiddenForCapture = NSApp.windows.filter(\.isVisible)
-        windowsHiddenForCapture.forEach { $0.orderOut(nil) }
 
         let candidatesByDisplayID = Self.windowCandidatesByDisplayID(for: screens)
         let displayIDs = candidatesByDisplayID.keys.sorted()
@@ -817,7 +820,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         isSelectionOverlayPresented = false
         statusMessage = "已取消截图"
         DiagnosticLogStore.shared.log(.info, category: "screenshot", "selection-cancelled")
-        restoreWindowsHiddenForCapture()
+        finishCaptureOverlaySession()
     }
 
     func toggleRecording() {
@@ -863,8 +866,6 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
             "selection-start displays=\(screens.count)"
         )
         AppDelegate.shared?.setCaptureOverlayActive(true)
-        windowsHiddenForCapture = NSApp.windows.filter(\.isVisible)
-        windowsHiddenForCapture.forEach { $0.orderOut(nil) }
         let candidatesByDisplayID = Self.windowCandidatesByDisplayID(for: screens)
         statusMessage = screens.count > 1
             ? "在任意屏幕选择要录制的窗口或自由区域"
@@ -876,6 +877,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
             initialPointerGlobalLocation: initialPointerGlobalLocation
         ) { result, options in
             CaptureController.shared.isSelectionOverlayPresented = false
+            CaptureController.shared.finishCaptureOverlaySession()
             CaptureController.shared.startRecording(selection: result, options: options)
         } onCancel: {
             CaptureController.shared.cancelRecordingSetup()
@@ -886,7 +888,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         isSelectionOverlayPresented = false
         statusMessage = "已取消录屏"
         DiagnosticLogStore.shared.log(.info, category: "recording", "selection-cancelled")
-        restoreWindowsHiddenForCapture()
+        finishCaptureOverlaySession()
     }
 
     func startRecording(selection: CaptureSelectionResult, options: RecordingOptions) {
@@ -2389,19 +2391,8 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         return result
     }
 
-    private func restoreWindowsHiddenForCapture() {
+    private func finishCaptureOverlaySession() {
         AppDelegate.shared?.setCaptureOverlayActive(false)
-        windowsHiddenForCapture.forEach { window in
-            let identifier = window.identifier?.rawValue ?? ""
-            let isIndependentFloatingWindow = identifier == FloatingThumbnailController.windowIdentifier.rawValue
-                || identifier.hasPrefix(PinnedScreenshotController.windowIdentifierPrefix)
-            if isIndependentFloatingWindow {
-                window.orderFrontRegardless()
-            } else {
-                window.orderFront(nil)
-            }
-        }
-        windowsHiddenForCapture = []
         frozenDisplayImages.removeAll()
     }
 
@@ -2439,7 +2430,6 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         isStoppingRecording = false
         isCapturing = false
         isRecording = false
-        restoreWindowsHiddenForCapture()
     }
 }
 

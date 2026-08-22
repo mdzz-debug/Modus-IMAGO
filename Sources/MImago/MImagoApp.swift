@@ -105,11 +105,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             isActive ? "activated" : "deactivated"
         )
         if isActive {
-            // The capture flow intentionally orders every ordinary app window
-            // out before presenting a borderless nonactivating panel. Such a
-            // panel does not count as a restorable app window, so SwiftUI/AppKit
-            // may otherwise automatically terminate the process while the
-            // user is still selecting or annotating a screenshot.
+            // A borderless nonactivating capture panel does not count as a
+            // restorable app window, so keep the process alive while the user
+            // is selecting or annotating a screenshot.
             ProcessInfo.processInfo.disableAutomaticTermination(
                 "M · Imago capture overlay is active"
             )
