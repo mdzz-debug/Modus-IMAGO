@@ -47,6 +47,9 @@ final class UpdateController {
     private let latestReleaseURL = URL(
         string: "https://api.github.com/repos/mdzz-debug/Modus-IMAGO/releases/latest"
     )!
+    private let latestReleasePageURL = URL(
+        string: "https://github.com/mdzz-debug/Modus-IMAGO/releases/latest"
+    )!
     private var isChecking = false
 
     private init() {}
@@ -64,32 +67,10 @@ final class UpdateController {
             guard let self else { return }
             defer { isChecking = false }
             do {
-                var request = URLRequest(url: latestReleaseURL)
-                request.setValue(
-                    "application/vnd.github+json",
-                    forHTTPHeaderField: "Accept"
-                )
-                request.setValue(
-                    "M-Imago/\(currentVersion)",
-                    forHTTPHeaderField: "User-Agent"
-                )
-                let (data, response) = try await URLSession.shared.data(
-                    for: request
-                )
-                guard let httpResponse = response as? HTTPURLResponse else {
-                    throw UpdateError.invalidResponse
-                }
-                if httpResponse.statusCode == 404 {
+                guard let release = try await fetchLatestRelease() else {
                     showNoPublishedReleaseAlert()
                     return
                 }
-                guard (200..<300).contains(httpResponse.statusCode) else {
-                    throw UpdateError.httpStatus(httpResponse.statusCode)
-                }
-                let release = try JSONDecoder().decode(
-                    GitHubRelease.self,
-                    from: data
-                )
                 guard !release.draft, !release.prerelease else {
                     showNoPublishedReleaseAlert()
                     return
@@ -104,6 +85,83 @@ final class UpdateController {
                 showFailureAlert(error)
             }
         }
+    }
+
+    private func fetchLatestRelease() async throws -> GitHubRelease? {
+        var request = URLRequest(url: latestReleaseURL)
+        request.timeoutInterval = 15
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue(
+            "application/vnd.github+json",
+            forHTTPHeaderField: "Accept"
+        )
+        request.setValue(
+            "2022-11-28",
+            forHTTPHeaderField: "X-GitHub-Api-Version"
+        )
+        request.setValue(
+            "M-Imago/\(currentVersion)",
+            forHTTPHeaderField: "User-Agent"
+        )
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw UpdateError.invalidResponse
+        }
+        if httpResponse.statusCode == 404 {
+            return nil
+        }
+        if httpResponse.statusCode == 403 || httpResponse.statusCode == 429 {
+            DiagnosticLogStore.shared.log(
+                .warning,
+                category: "update",
+                "github-api-limited status=\(httpResponse.statusCode) "
+                    + "remaining=\(httpResponse.value(forHTTPHeaderField: "X-RateLimit-Remaining") ?? "unknown")"
+            )
+            return try await fetchLatestReleaseFromRedirect()
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw UpdateError.httpStatus(httpResponse.statusCode)
+        }
+        return try JSONDecoder().decode(GitHubRelease.self, from: data)
+    }
+
+    private func fetchLatestReleaseFromRedirect() async throws -> GitHubRelease? {
+        var request = URLRequest(url: latestReleasePageURL)
+        request.timeoutInterval = 15
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue(
+            "M-Imago/\(currentVersion)",
+            forHTTPHeaderField: "User-Agent"
+        )
+
+        let (_, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse,
+              let finalURL = httpResponse.url else {
+            throw UpdateError.invalidResponse
+        }
+        guard (200..<400).contains(httpResponse.statusCode) else {
+            throw UpdateError.httpStatus(httpResponse.statusCode)
+        }
+        guard finalURL.path.contains("/releases/tag/"),
+              let encodedTag = finalURL.pathComponents.last,
+              !encodedTag.isEmpty else {
+            return nil
+        }
+
+        let tag = encodedTag.removingPercentEncoding ?? encodedTag
+        DiagnosticLogStore.shared.log(
+            .info,
+            category: "update",
+            "github-release-fallback-succeeded tag=\(tag)"
+        )
+        return GitHubRelease(
+            tagName: tag,
+            name: nil,
+            htmlURL: finalURL,
+            draft: false,
+            prerelease: false
+        )
     }
 
     private var currentVersion: String {
