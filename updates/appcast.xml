@@ -12,15 +12,19 @@
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
             <description sparkle:format="markdown"><![CDATA[# M · Imago 0.1.2
 
+- 自由截图触发后立即定格所有显示器画面，便于捕捉动画、视频和瞬时内容。
+- Retina 显示器的定格画面改为按真实背板像素捕获，文字和界面细节不再模糊。
+- 定格画面仍保留原有窗口识别、悬停高亮和单击选窗能力。
+- 修复定格帧中的 Dock 与实时 Dock 重叠显示的问题。
 - 修复副显示器中的应用进入 macOS 原生全屏后无法选择该屏幕的问题。
 - 修复副屏点击穿透后截图会话无法结束的问题。
-- 修复选中窗口后 Esc 偶尔无法退出截图的问题。
+- 修复选中窗口后 Esc 偶尔无法退出截图的问题，并增加不依赖窗口焦点的按键状态兜底监测。
 - 截图和录屏工具栏会避开 Dock；Dock 保持显示并仍可包含在截图中。
 - 优化多屏全屏 Space 中遮罩窗口的层级和键盘焦点。
 
 此版本用于验证从 0.1.1 到 0.1.2 的 Sparkle 应用内更新流程。
 ]]></description>
-            <enclosure url="https://github.com/mdzz-debug/Modus-IMAGO/releases/download/v0.1.2/M-Imago-v0.1.2-arm64.zip" length="5598979" type="application/octet-stream" sparkle:edSignature="mR+gBiNlH575b2aohLHoQD81zf3T51qDirjtmt4E2/5lmgZmP4hSR8dsonvs7zz0NolYScJtYA6/5ZqqzRarCQ=="/>
+            <enclosure url="https://github.com/mdzz-debug/Modus-IMAGO/releases/download/v0.1.2/M-Imago-v0.1.2-arm64.zip" length="5610309" type="application/octet-stream" sparkle:edSignature="qqxxdHhveetHTrUpcUvcOCEkkCLVNIJx44hSvB18Ux+3ZroG/Isoo/b0eB9D0O+YUSzHSL3BSJWZgbLxywuqDw=="/>
         </item>
     </channel>
 </rss>

@@ -152,6 +152,8 @@ enum CaptureSelectionTarget: Sendable, Hashable {
 
 struct CaptureSelectionResult: Sendable, Hashable {
     let target: CaptureSelectionTarget
+    let displayID: CGDirectDisplayID
+    let normalizedFrame: CGRect
     let annotations: [CaptureAnnotation]
     let action: CaptureResultAction
 }
@@ -244,6 +246,30 @@ private final class CaptureOverlayPanel: NSPanel {
     }
 }
 
+private final class FrozenDisplayImageView: NSView {
+    init(frame: CGRect, image: CGImage, backingScaleFactor: CGFloat) {
+        super.init(frame: frame)
+        autoresizingMask = [.width, .height]
+        wantsLayer = true
+        layer?.contents = image
+        layer?.contentsGravity = .resize
+        layer?.contentsScale = backingScaleFactor
+        layer?.magnificationFilter = .linear
+        layer?.minificationFilter = .linear
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // The frozen frame is presentation-only. Returning nil guarantees it
+        // can never steal mouse focus or keyboard routing from the overlay.
+        nil
+    }
+}
+
 private extension NSView {
     var firstEditableTextField: NSTextField? {
         if let textField = self as? NSTextField,
@@ -299,6 +325,7 @@ enum FreeSelectionOverlay {
     private static var longScreenshotPreviewPanels: [CGDirectDisplayID: NSPanel] = [:]
     private static var escapeMonitor: Any?
     private static var globalEscapeMonitor: Any?
+    private static var escapeKeyStateTask: Task<Void, Never>?
     private static var escapedClickMonitor: Any?
     private static var cancelAction: (() -> Void)?
     private static var watchdogTask: Task<Void, Never>?
@@ -308,6 +335,7 @@ enum FreeSelectionOverlay {
     static func present(
         on screens: [NSScreen],
         windowCandidatesByDisplayID: [CGDirectDisplayID: [CaptureWindowCandidate]],
+        frozenImagesByDisplayID: [CGDirectDisplayID: CGImage],
         initialPointerGlobalLocation: CGPoint,
         onConfirm: @escaping (CaptureSelectionResult) -> Void,
         onLongScreenshot: @escaping (CGImage) -> Void,
@@ -317,6 +345,7 @@ enum FreeSelectionOverlay {
             purpose: .screenshot,
             screens: screens,
             windowCandidatesByDisplayID: windowCandidatesByDisplayID,
+            frozenImagesByDisplayID: frozenImagesByDisplayID,
             initialPointerGlobalLocation: initialPointerGlobalLocation,
             onConfirm: { result, _ in onConfirm(result) },
             onLongScreenshot: onLongScreenshot,
@@ -335,6 +364,7 @@ enum FreeSelectionOverlay {
             purpose: .recording,
             screens: screens,
             windowCandidatesByDisplayID: windowCandidatesByDisplayID,
+            frozenImagesByDisplayID: [:],
             initialPointerGlobalLocation: initialPointerGlobalLocation,
             onConfirm: { result, options in
                 guard let options else { return }
@@ -349,6 +379,7 @@ enum FreeSelectionOverlay {
         purpose: CaptureOverlayPurpose,
         screens: [NSScreen],
         windowCandidatesByDisplayID: [CGDirectDisplayID: [CaptureWindowCandidate]],
+        frozenImagesByDisplayID: [CGDirectDisplayID: CGImage],
         initialPointerGlobalLocation: CGPoint,
         onConfirm: @escaping (CaptureSelectionResult, RecordingOptions?) -> Void,
         onLongScreenshot: @escaping (CGImage) -> Void,
@@ -391,7 +422,12 @@ enum FreeSelectionOverlay {
             panel.isOpaque = false
             panel.backgroundColor = .clear
             panel.hasShadow = false
-            panel.level = .screenSaver
+            // The frozen frame already contains the Dock. Keep the capture
+            // surface above the live Dock so it cannot appear a second time
+            // or react to pointer hover during selection.
+            panel.level = NSWindow.Level(
+                rawValue: NSWindow.Level.screenSaver.rawValue + 2
+            )
             panel.hidesOnDeactivate = false
             panel.isFloatingPanel = true
             panel.becomesKeyOnlyIfNeeded = false
@@ -440,7 +476,18 @@ enum FreeSelectionOverlay {
             })
             hostingView.frame = CGRect(origin: .zero, size: screen.frame.size)
             hostingView.autoresizingMask = [.width, .height]
-            panel.contentView = hostingView
+            let contentView = NSView(frame: CGRect(origin: .zero, size: screen.frame.size))
+            contentView.autoresizingMask = [.width, .height]
+            if let frozenImage = frozenImagesByDisplayID[displayID] {
+                let imageView = FrozenDisplayImageView(
+                    frame: contentView.bounds,
+                    image: frozenImage,
+                    backingScaleFactor: screen.backingScaleFactor
+                )
+                contentView.addSubview(imageView)
+            }
+            contentView.addSubview(hostingView)
+            panel.contentView = contentView
             // Assigning an NSHostingView may cause AppKit to refit a panel to
             // its visible screen area. Reassert each complete display frame.
             panel.setFrame(screen.frame, display: false)
@@ -478,6 +525,7 @@ enum FreeSelectionOverlay {
                 cancel()
             }
         }
+        startEscapeKeyStateMonitor()
         escapedClickMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown]
         ) { _ in
@@ -560,7 +608,7 @@ enum FreeSelectionOverlay {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = false
-        panel.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 3)
         panel.hidesOnDeactivate = false
         panel.isFloatingPanel = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
@@ -599,6 +647,8 @@ enum FreeSelectionOverlay {
     static func dismiss() {
         watchdogTask?.cancel()
         watchdogTask = nil
+        escapeKeyStateTask?.cancel()
+        escapeKeyStateTask = nil
         if let escapeMonitor {
             NSEvent.removeMonitor(escapeMonitor)
             self.escapeMonitor = nil
@@ -625,6 +675,31 @@ enum FreeSelectionOverlay {
         cancelAction = nil
         restoreDockMagnificationIfNeeded()
         NSCursor.arrow.set()
+    }
+
+    private static func startEscapeKeyStateMonitor() {
+        escapeKeyStateTask?.cancel()
+        escapeKeyStateTask = Task { @MainActor in
+            var wasPressed = CGEventSource.keyState(.combinedSessionState, key: 53)
+            while !Task.isCancelled, !activePanels.isEmpty {
+                do {
+                    try await Task.sleep(for: .milliseconds(16))
+                } catch {
+                    return
+                }
+                let isPressed = CGEventSource.keyState(.combinedSessionState, key: 53)
+                if isPressed, !wasPressed {
+                    DiagnosticLogStore.shared.log(
+                        .debug,
+                        category: "capture-overlay",
+                        "escape-received source=key-state-monitor"
+                    )
+                    cancel()
+                    return
+                }
+                wasPressed = isPressed
+            }
+        }
     }
 
     private static func suppressDockMagnification() {
@@ -2501,6 +2576,12 @@ private struct FreeSelectionOverlayView: View {
         }
 
         let target: CaptureSelectionTarget
+        let normalizedFrame = CGRect(
+            x: frame.minX / bounds.width,
+            y: frame.minY / bounds.height,
+            width: frame.width / bounds.width,
+            height: frame.height / bounds.height
+        )
         switch confirmedSelection {
         case let .window(candidate):
             target = .window(windowID: candidate.windowID, processID: candidate.processID)
@@ -2518,6 +2599,8 @@ private struct FreeSelectionOverlayView: View {
         onConfirm(
             CaptureSelectionResult(
                 target: target,
+                displayID: displayID,
+                normalizedFrame: normalizedFrame,
                 annotations: normalizedAnnotations,
                 action: purpose == .recording ? .finish : action
             ),

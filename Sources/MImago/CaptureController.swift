@@ -444,6 +444,11 @@ private final class LongScreenshotFrameProcessor: @unchecked Sendable {
     }
 }
 
+private struct FrozenDisplayCaptureInput: @unchecked Sendable {
+    let display: SCDisplay
+    let excludedApplication: SCRunningApplication?
+}
+
 @MainActor
 final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCRecordingOutputDelegate {
     static let shared = CaptureController()
@@ -623,6 +628,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
     private var recordingDurationTask: Task<Void, Never>?
     private var isStoppingRecording = false
     private var windowsHiddenForCapture: [NSWindow] = []
+    private var frozenDisplayImages: [CGDirectDisplayID: CGImage] = [:]
     private var isSelectionOverlayPresented = false
 
     func setStatusMessage(_ message: String) {
@@ -677,19 +683,26 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
                 }
 
                 let captured: CGImage
-                switch result.target {
-                case let .window(windowID, processID):
-                    Self.raiseWindow(windowID: windowID, processID: processID)
-                    try await Task.sleep(for: .milliseconds(180))
-                    captured = try await Self.captureWindowImage(
-                        windowID: windowID,
-                        processID: processID
+                if let frozenImage = self?.frozenDisplayImages[result.displayID] {
+                    captured = try Self.cropFrozenDisplayImage(
+                        frozenImage,
+                        normalizedRect: result.normalizedFrame
                     )
-                case let .region(displayID, normalizedRect):
-                    captured = try await Self.captureDisplayRegionImage(
-                        displayID: displayID,
-                        normalizedRect: normalizedRect
-                    )
+                } else {
+                    switch result.target {
+                    case let .window(windowID, processID):
+                        Self.raiseWindow(windowID: windowID, processID: processID)
+                        try await Task.sleep(for: .milliseconds(180))
+                        captured = try await Self.captureWindowImage(
+                            windowID: windowID,
+                            processID: processID
+                        )
+                    case let .region(displayID, normalizedRect):
+                        captured = try await Self.captureDisplayRegionImage(
+                            displayID: displayID,
+                            normalizedRect: normalizedRect
+                        )
+                    }
                 }
 
                 let finished = try Self.drawing(result.annotations, on: captured)
@@ -741,6 +754,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         }
 
         isSelectionOverlayPresented = true
+        frozenDisplayImages.removeAll()
         DiagnosticLogStore.shared.log(
             .info,
             category: "screenshot",
@@ -755,21 +769,47 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         windowsHiddenForCapture.forEach { $0.orderOut(nil) }
 
         let candidatesByDisplayID = Self.windowCandidatesByDisplayID(for: screens)
-        statusMessage = screens.count > 1
-            ? "在任意屏幕选择窗口，或拖拽自由区域"
-            : "移动鼠标选择窗口，或拖拽自由区域"
-        FreeSelectionOverlay.present(
-            on: screens,
-            windowCandidatesByDisplayID: candidatesByDisplayID,
-            initialPointerGlobalLocation: initialPointerGlobalLocation
-        ) { result in
-            CaptureController.shared.isSelectionOverlayPresented = false
-            CaptureController.shared.takeFreeScreenshot(result)
-        } onLongScreenshot: { image in
-            CaptureController.shared.isSelectionOverlayPresented = false
-            CaptureController.shared.finishManualLongScreenshot(image)
-        } onCancel: {
-            CaptureController.shared.cancelFreeScreenshot()
+        let displayIDs = candidatesByDisplayID.keys.sorted()
+        statusMessage = "正在定格画面…"
+        let freezeStartedAt = ContinuousClock.now
+        Task { [weak self] in
+            guard let self else { return }
+            let frozenImages: [CGDirectDisplayID: CGImage]
+            do {
+                frozenImages = try await Self.captureFrozenDisplayImages(displayIDs: displayIDs)
+                let elapsed = freezeStartedAt.duration(to: .now)
+                DiagnosticLogStore.shared.log(
+                    .info,
+                    category: "screenshot",
+                    "freeze-ready displays=\(frozenImages.count) elapsed=\(elapsed)"
+                )
+            } catch {
+                frozenImages = [:]
+                DiagnosticLogStore.shared.log(
+                    .warning,
+                    category: "screenshot",
+                    "freeze-failed; using-live-overlay error=\(error.localizedDescription)"
+                )
+            }
+            guard self.isSelectionOverlayPresented else { return }
+            self.frozenDisplayImages = frozenImages
+            self.statusMessage = screens.count > 1
+                ? "画面已定格，在任意屏幕选择窗口或区域"
+                : "画面已定格，选择窗口或拖拽区域"
+            FreeSelectionOverlay.present(
+                on: screens,
+                windowCandidatesByDisplayID: candidatesByDisplayID,
+                frozenImagesByDisplayID: frozenImages,
+                initialPointerGlobalLocation: initialPointerGlobalLocation
+            ) { result in
+                CaptureController.shared.isSelectionOverlayPresented = false
+                CaptureController.shared.takeFreeScreenshot(result)
+            } onLongScreenshot: { image in
+                CaptureController.shared.isSelectionOverlayPresented = false
+                CaptureController.shared.finishManualLongScreenshot(image)
+            } onCancel: {
+                CaptureController.shared.cancelFreeScreenshot()
+            }
         }
     }
 
@@ -816,6 +856,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         }
 
         isSelectionOverlayPresented = true
+        frozenDisplayImages.removeAll()
         DiagnosticLogStore.shared.log(
             .info,
             category: "recording",
@@ -1126,6 +1167,98 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
             NSWorkspace.shared.activateFileViewerSelecting([destination])
         }
         statusMessage = completion == .copy ? "截图已复制到剪贴板" : "截图已完成"
+    }
+
+    nonisolated private static func captureFrozenDisplayImages(
+        displayIDs: [CGDirectDisplayID]
+    ) async throws -> [CGDirectDisplayID: CGImage] {
+        let content = try await SCShareableContent.excludingDesktopWindows(
+            false,
+            onScreenWindowsOnly: true
+        )
+        let requestedIDs = Set(displayIDs)
+        let displays = content.displays.filter { requestedIDs.contains($0.displayID) }
+        guard !displays.isEmpty else { throw CaptureError.noDisplayAvailable }
+        let ownApplication = content.applications.first {
+            $0.processID == ProcessInfo.processInfo.processIdentifier
+        }
+        let inputs = displays.map {
+            FrozenDisplayCaptureInput(display: $0, excludedApplication: ownApplication)
+        }
+
+        return try await withThrowingTaskGroup(
+            of: (CGDirectDisplayID, CGImage).self,
+            returning: [CGDirectDisplayID: CGImage].self
+        ) { group in
+            for input in inputs {
+                group.addTask {
+                    let display = input.display
+                    let configuration = SCStreamConfiguration()
+                    // SCDisplay.width/height follow the display's logical mode.
+                    // On a Retina display that is only half of the backing pixel
+                    // dimensions, so presenting it full-screen visibly softens
+                    // text and the cropped screenshot permanently loses detail.
+                    let displayMode = CGDisplayCopyDisplayMode(display.displayID)
+                    configuration.width = displayMode?.pixelWidth ?? display.width
+                    configuration.height = displayMode?.pixelHeight ?? display.height
+                    configuration.captureResolution = .best
+                    configuration.showsCursor = false
+                    configuration.capturesAudio = false
+                    let filter: SCContentFilter
+                    if let excludedApplication = input.excludedApplication {
+                        filter = SCContentFilter(
+                            display: display,
+                            excludingApplications: [excludedApplication],
+                            exceptingWindows: []
+                        )
+                    } else {
+                        filter = SCContentFilter(display: display, excludingWindows: [])
+                    }
+                    let image = try await SCScreenshotManager.captureImage(
+                        contentFilter: filter,
+                        configuration: configuration
+                    )
+                    DiagnosticLogStore.shared.log(
+                        .debug,
+                        category: "screenshot",
+                        "freeze-display id=\(display.displayID) logical=\(display.width)x\(display.height) requested=\(configuration.width)x\(configuration.height) received=\(image.width)x\(image.height)"
+                    )
+                    return (display.displayID, image)
+                }
+            }
+
+            var images: [CGDirectDisplayID: CGImage] = [:]
+            for try await (displayID, image) in group {
+                images[displayID] = image
+            }
+            return images
+        }
+    }
+
+    nonisolated private static func cropFrozenDisplayImage(
+        _ image: CGImage,
+        normalizedRect: CGRect
+    ) throws -> CGImage {
+        let unitBounds = CGRect(x: 0, y: 0, width: 1, height: 1)
+        let clamped = normalizedRect.standardized.intersection(unitBounds)
+        guard !clamped.isNull, clamped.width > 0, clamped.height > 0 else {
+            throw CaptureError.invalidSelection
+        }
+        let imageBounds = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        let pixelRect = CGRect(
+            x: floor(clamped.minX * CGFloat(image.width)),
+            y: floor(clamped.minY * CGFloat(image.height)),
+            width: ceil(clamped.maxX * CGFloat(image.width))
+                - floor(clamped.minX * CGFloat(image.width)),
+            height: ceil(clamped.maxY * CGFloat(image.height))
+                - floor(clamped.minY * CGFloat(image.height))
+        ).intersection(imageBounds)
+        guard let cropped = image.cropping(to: pixelRect),
+              cropped.width > 0,
+              cropped.height > 0 else {
+            throw CaptureError.imageUnavailable
+        }
+        return cropped
     }
 
     nonisolated private static func captureMainDisplayImage() async throws -> CGImage {
@@ -2269,6 +2402,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
             }
         }
         windowsHiddenForCapture = []
+        frozenDisplayImages.removeAll()
     }
 
     nonisolated private static func captureFailureMessage(
