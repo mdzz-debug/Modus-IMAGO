@@ -150,10 +150,11 @@ enum CaptureSelectionTarget: Sendable, Hashable {
     case region(displayID: CGDirectDisplayID, normalizedRect: CGRect)
 }
 
-struct CaptureSelectionResult: Sendable, Hashable {
+struct CaptureSelectionResult: @unchecked Sendable {
     let target: CaptureSelectionTarget
     let displayID: CGDirectDisplayID
     let normalizedFrame: CGRect
+    let activatedWindowImage: CGImage?
     let annotations: [CaptureAnnotation]
     let action: CaptureResultAction
 }
@@ -247,7 +248,11 @@ private final class CaptureOverlayPanel: NSPanel {
 }
 
 private final class FrozenDisplayImageView: NSView {
+    private let activatedWindowLayer = CALayer()
+    private let captureBackingScaleFactor: CGFloat
+
     init(frame: CGRect, image: CGImage, backingScaleFactor: CGFloat) {
+        captureBackingScaleFactor = backingScaleFactor
         super.init(frame: frame)
         autoresizingMask = [.width, .height]
         wantsLayer = true
@@ -256,6 +261,12 @@ private final class FrozenDisplayImageView: NSView {
         layer?.contentsScale = backingScaleFactor
         layer?.magnificationFilter = .linear
         layer?.minificationFilter = .linear
+        activatedWindowLayer.contentsGravity = .resize
+        activatedWindowLayer.contentsScale = backingScaleFactor
+        activatedWindowLayer.magnificationFilter = .linear
+        activatedWindowLayer.minificationFilter = .linear
+        activatedWindowLayer.isHidden = true
+        layer?.addSublayer(activatedWindowLayer)
     }
 
     @available(*, unavailable)
@@ -267,6 +278,18 @@ private final class FrozenDisplayImageView: NSView {
         // The frozen frame is presentation-only. Returning nil guarantees it
         // can never steal mouse focus or keyboard routing from the overlay.
         nil
+    }
+
+    func showActivatedWindow(_ image: CGImage, in topLeftFrame: CGRect) {
+        activatedWindowLayer.contents = image
+        activatedWindowLayer.contentsScale = captureBackingScaleFactor
+        activatedWindowLayer.frame = CGRect(
+            x: topLeftFrame.minX,
+            y: bounds.height - topLeftFrame.maxY,
+            width: topLeftFrame.width,
+            height: topLeftFrame.height
+        )
+        activatedWindowLayer.isHidden = false
     }
 }
 
@@ -597,6 +620,17 @@ enum FreeSelectionOverlay {
             category: "capture-overlay",
             "keyboard-panel-claimed display=\(displayID)"
         )
+    }
+
+    static func showActivatedWindowPreview(
+        on displayID: CGDirectDisplayID,
+        image: CGImage,
+        frame: CGRect
+    ) {
+        guard let frozenView = activePanels[displayID]?.contentView?.subviews
+            .compactMap({ $0 as? FrozenDisplayImageView })
+            .first else { return }
+        frozenView.showActivatedWindow(image, in: frame)
     }
 
     static func presentLongScreenshotPreview(
@@ -1009,6 +1043,8 @@ private struct FreeSelectionOverlayView: View {
     @State private var longScreenshotScrollTarget: CaptureController.ManualLongScreenshotScrollTarget?
     @State private var isCheckingLongScreenshotAvailability = false
     @State private var longScreenshotAvailabilityTask: Task<Void, Never>?
+    @State private var windowActivationTask: Task<Void, Never>?
+    @State private var activatedWindowImage: CGImage?
 
     init(
         purpose: CaptureOverlayPurpose,
@@ -1188,6 +1224,8 @@ private struct FreeSelectionOverlayView: View {
             recordingCountdownTask = nil
             longScreenshotAvailabilityTask?.cancel()
             longScreenshotAvailabilityTask = nil
+            windowActivationTask?.cancel()
+            windowActivationTask = nil
             longScreenshotSession?.stop()
             FreeSelectionOverlay.dismissLongScreenshotPreview(on: displayID)
             NSCursor.arrow.set()
@@ -1307,6 +1345,7 @@ private struct FreeSelectionOverlayView: View {
                        let candidate = windowAt(value.startLocation) ?? windowAt(value.location) {
                         confirmedSelection = .window(candidate)
                         hoveredWindow = candidate
+                        prepareActivatedWindowPreview(candidate)
                     } else {
                         confirmedSelection = .region(bounds)
                         hoveredWindow = nil
@@ -1354,6 +1393,38 @@ private struct FreeSelectionOverlayView: View {
                     beginNewText(at: clamped(value.location, to: selection))
                 }
             }
+    }
+
+    private func prepareActivatedWindowPreview(_ candidate: CaptureWindowCandidate) {
+        guard purpose == .screenshot else { return }
+        windowActivationTask?.cancel()
+        activatedWindowImage = nil
+        windowActivationTask = Task { @MainActor in
+            do {
+                let image = try await CaptureController.shared.captureActivatedWindowImage(
+                    windowID: candidate.windowID,
+                    processID: candidate.processID
+                )
+                guard !Task.isCancelled,
+                      case let .window(currentCandidate) = confirmedSelection,
+                      currentCandidate.windowID == candidate.windowID,
+                      currentCandidate.processID == candidate.processID else { return }
+                activatedWindowImage = image
+                FreeSelectionOverlay.showActivatedWindowPreview(
+                    on: displayID,
+                    image: image,
+                    frame: candidate.frame
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                DiagnosticLogStore.shared.log(
+                    .warning,
+                    category: "screenshot",
+                    "activated-window-preview-failed id=\(candidate.windowID) error=\(error.localizedDescription)"
+                )
+            }
+        }
     }
 
     private var lockedDisplayMessage: some View {
@@ -2612,6 +2683,7 @@ private struct FreeSelectionOverlayView: View {
                 target: target,
                 displayID: displayID,
                 normalizedFrame: normalizedFrame,
+                activatedWindowImage: activatedWindowImage,
                 annotations: normalizedAnnotations,
                 action: purpose == .recording ? .finish : action
             ),

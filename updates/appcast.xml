@@ -19,6 +19,7 @@
 - 定格完成后使用系统遮蔽层隐藏真实 Dock 和菜单栏，避免其继续响应悬停或点击。
 - 截图和录屏选区期间不再隐藏或重新置前 M · Imago 窗口，避免结束后打乱微信等应用的窗口层级。
 - 窗口截图会先激活目标窗口并等待界面完成焦点重绘，再以 Retina 原生像素单独捕获；自由区域仍保留触发瞬间的冻结画面。
+- 点选窗口后会把激活状态的最新窗口图覆盖回冻结选区，确保确认前的视觉反馈与最终截图一致。
 - 修复副显示器中的应用进入 macOS 原生全屏后无法选择该屏幕的问题。
 - 修复副屏点击穿透后截图会话无法结束的问题。
 - 修复选中窗口后 Esc 偶尔无法退出截图的问题，并增加不依赖窗口焦点的按键状态兜底监测。
@@ -27,7 +28,7 @@
 
 此版本用于验证从 0.1.1 到 0.1.2 的 Sparkle 应用内更新流程。
 ]]></description>
-            <enclosure url="https://github.com/mdzz-debug/Modus-IMAGO/releases/download/v0.1.2/M-Imago-v0.1.2-arm64.zip" length="5610158" type="application/octet-stream" sparkle:edSignature="AjU7C23AsAvi8phtv8Ad8u/Iw1raVOs4TxY+4HLNFEe8DA57+qNIaTpN7+wG/OrkCWsmdxEdYCO6U2jLr2D1DA=="/>
+            <enclosure url="https://github.com/mdzz-debug/Modus-IMAGO/releases/download/v0.1.2/M-Imago-v0.1.2-arm64.zip" length="5615825" type="application/octet-stream" sparkle:edSignature="VywGPu/LyUR1L0Y7TMA3dp1x4yQitAQmXr9otVebL/QeaRT/WVASs0skokZgSZ0z5wUrsNEAqLrfP7t22UTjAw=="/>
         </item>
     </channel>
 </rss>

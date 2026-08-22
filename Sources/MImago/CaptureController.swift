@@ -655,6 +655,30 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         }
     }
 
+    func captureActivatedWindowImage(
+        windowID: CGWindowID,
+        processID: pid_t
+    ) async throws -> CGImage {
+        Self.raiseWindow(windowID: windowID, processID: processID)
+        DiagnosticLogStore.shared.log(
+            .debug,
+            category: "screenshot",
+            "selected-window-raised-before-preview id=\(windowID) pid=\(processID)"
+        )
+        try await Task.sleep(for: .milliseconds(180))
+        try Task.checkCancellation()
+        let image = try await Self.captureWindowImage(
+            windowID: windowID,
+            processID: processID
+        )
+        DiagnosticLogStore.shared.log(
+            .debug,
+            category: "screenshot",
+            "activated-window-preview-ready id=\(windowID) size=\(image.width)x\(image.height)"
+        )
+        return image
+    }
+
     func takeFreeScreenshot(_ result: CaptureSelectionResult) {
         statusMessage = result.action == .longScreenshot ? "正在截取长图…" : "正在处理选区…"
         Task { [weak self] in
@@ -684,21 +708,19 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
                 let captured: CGImage
                 switch result.target {
                 case let .window(windowID, processID):
-                    // Window capture intentionally switches back to a live,
-                    // desktop-independent image after selection. This lets the
-                    // target app repaint its title bar and controls as active
-                    // before the final image is produced.
-                    Self.raiseWindow(windowID: windowID, processID: processID)
-                    DiagnosticLogStore.shared.log(
-                        .debug,
-                        category: "screenshot",
-                        "selected-window-raised-before-capture id=\(windowID) pid=\(processID)"
-                    )
-                    try await Task.sleep(for: .milliseconds(180))
-                    captured = try await Self.captureWindowImage(
-                        windowID: windowID,
-                        processID: processID
-                    )
+                    if let activatedWindowImage = result.activatedWindowImage {
+                        captured = activatedWindowImage
+                        DiagnosticLogStore.shared.log(
+                            .debug,
+                            category: "screenshot",
+                            "activated-window-preview-reused id=\(windowID)"
+                        )
+                    } else {
+                        captured = try await CaptureController.shared.captureActivatedWindowImage(
+                            windowID: windowID,
+                            processID: processID
+                        )
+                    }
 
                 case let .region(displayID, normalizedRect):
                     try await Task.sleep(for: .milliseconds(120))
