@@ -288,6 +288,8 @@ enum FreeSelectionOverlay {
     private static var activePanels: [CGDirectDisplayID: NSPanel] = [:]
     private static var longScreenshotPreviewPanels: [CGDirectDisplayID: NSPanel] = [:]
     private static var escapeMonitor: Any?
+    private static var globalEscapeMonitor: Any?
+    private static var escapedClickMonitor: Any?
     private static var cancelAction: (() -> Void)?
     private static var watchdogTask: Task<Void, Never>?
     private static var previousDockMagnification: Bool?
@@ -362,10 +364,16 @@ enum FreeSelectionOverlay {
                 x: initialPointerGlobalLocation.x - screen.frame.minX,
                 y: screen.frame.maxY - initialPointerGlobalLocation.y
             )
+            let controlPlacementBounds = CGRect(
+                x: screen.visibleFrame.minX - screen.frame.minX,
+                y: screen.frame.maxY - screen.visibleFrame.maxY,
+                width: screen.visibleFrame.width,
+                height: screen.visibleFrame.height
+            )
 
             let panel = CaptureOverlayPanel(
                 contentRect: screen.frame,
-                styleMask: [.borderless],
+                styleMask: [.borderless, .nonactivatingPanel],
                 backing: .buffered,
                 defer: false
             )
@@ -375,6 +383,7 @@ enum FreeSelectionOverlay {
             panel.hasShadow = false
             panel.level = .screenSaver
             panel.hidesOnDeactivate = false
+            panel.isFloatingPanel = true
             panel.becomesKeyOnlyIfNeeded = false
             panel.ignoresMouseEvents = false
             panel.isMovable = false
@@ -382,7 +391,6 @@ enum FreeSelectionOverlay {
             panel.collectionBehavior = [
                 .canJoinAllSpaces,
                 .fullScreenAuxiliary,
-                .stationary,
                 .ignoresCycle
             ]
             panel.acceptsMouseMovedEvents = true
@@ -396,6 +404,7 @@ enum FreeSelectionOverlay {
                     session: session,
                     windowCandidates: windowCandidatesByDisplayID[displayID] ?? [],
                     initialPointerLocation: initialPointerLocation,
+                    controlPlacementBounds: controlPlacementBounds,
                     onConfirm: { result, options in
                         DiagnosticLogStore.shared.log(
                             .info,
@@ -440,6 +449,35 @@ enum FreeSelectionOverlay {
             Task { @MainActor in cancel() }
             return nil
         }
+        globalEscapeMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { event in
+            guard event.keyCode == 53 else { return }
+            Task { @MainActor in
+                guard !activePanels.isEmpty else { return }
+                DiagnosticLogStore.shared.log(
+                    .warning,
+                    category: "capture-overlay",
+                    "escape-received-outside-overlay; cancelling selection"
+                )
+                cancel()
+            }
+        }
+        escapedClickMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { _ in
+            // Global monitors only receive events delivered to another app.
+            // If one fires while selecting, an overlay failed to cover the
+            // active Space. Cancel immediately instead of leaving the capture
+            // controller locked in an active-selection state.
+            Task { @MainActor in
+                guard !activePanels.isEmpty else { return }
+                DiagnosticLogStore.shared.log(
+                    .error,
+                    category: "capture-overlay",
+                    "mouse-event-escaped-overlay; cancelling selection"
+                )
+                cancel()
+            }
+        }
         watchdogTask = Task { @MainActor in
             do {
                 try await Task.sleep(for: .seconds(30))
@@ -454,15 +492,35 @@ enum FreeSelectionOverlay {
             )
         }
         suppressDockMagnification()
-        NSApp.activate(ignoringOtherApps: true)
         for panel in activePanels.values where panel !== initialPanel {
             panel.orderFrontRegardless()
         }
         (initialPanel ?? activePanels.values.first)?.makeKeyAndOrderFront(nil)
+
+        // Re-order once on the next run-loop turn. Full-screen Spaces on a
+        // secondary display may finish attaching auxiliary windows only after
+        // the first WindowServer transaction has committed.
+        DispatchQueue.main.async {
+            guard !activePanels.isEmpty else { return }
+            for panel in activePanels.values {
+                panel.orderFrontRegardless()
+            }
+            (initialPanel ?? activePanels.values.first)?.makeKey()
+        }
     }
 
     static func focusTextEditor(on displayID: CGDirectDisplayID) {
         (activePanels[displayID] as? CaptureOverlayPanel)?.focusTextEditor()
+    }
+
+    static func activatePanel(on displayID: CGDirectDisplayID) {
+        guard let panel = activePanels[displayID], !panel.isKeyWindow else { return }
+        panel.makeKeyAndOrderFront(nil)
+        DiagnosticLogStore.shared.log(
+            .debug,
+            category: "capture-overlay",
+            "keyboard-panel-claimed display=\(displayID)"
+        )
     }
 
     static func presentLongScreenshotPreview(
@@ -477,7 +535,7 @@ enum FreeSelectionOverlay {
         let panelSize = CGSize(width: 238, height: 268)
         let panel = CaptureOverlayPanel(
             contentRect: CGRect(origin: .zero, size: panelSize),
-            styleMask: [.borderless],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
@@ -487,7 +545,8 @@ enum FreeSelectionOverlay {
         panel.hasShadow = false
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
         panel.hidesOnDeactivate = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        panel.isFloatingPanel = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         panel.contentView = NSHostingView(rootView: FormaUIRoot(soundCenter: ApplicationPreferences.shared.soundCenter) {
             LongScreenshotPreviewCard(
                 session: session,
@@ -526,6 +585,14 @@ enum FreeSelectionOverlay {
         if let escapeMonitor {
             NSEvent.removeMonitor(escapeMonitor)
             self.escapeMonitor = nil
+        }
+        if let globalEscapeMonitor {
+            NSEvent.removeMonitor(globalEscapeMonitor)
+            self.globalEscapeMonitor = nil
+        }
+        if let escapedClickMonitor {
+            NSEvent.removeMonitor(escapedClickMonitor)
+            self.escapedClickMonitor = nil
         }
         activePanels.values.forEach {
             ($0 as? CaptureOverlayPanel)?.onCancelRequested = nil
@@ -806,6 +873,7 @@ private struct FreeSelectionOverlayView: View {
     let displayID: CGDirectDisplayID
     @ObservedObject var session: CaptureOverlaySession
     let windowCandidates: [CaptureWindowCandidate]
+    let controlPlacementBounds: CGRect
     let onConfirm: (CaptureSelectionResult, RecordingOptions?) -> Void
     let onLongScreenshot: (CGImage) -> Void
     let onCancel: () -> Void
@@ -845,6 +913,7 @@ private struct FreeSelectionOverlayView: View {
         session: CaptureOverlaySession,
         windowCandidates: [CaptureWindowCandidate],
         initialPointerLocation: CGPoint,
+        controlPlacementBounds: CGRect,
         onConfirm: @escaping (CaptureSelectionResult, RecordingOptions?) -> Void,
         onLongScreenshot: @escaping (CGImage) -> Void,
         onCancel: @escaping () -> Void
@@ -853,6 +922,7 @@ private struct FreeSelectionOverlayView: View {
         self.displayID = displayID
         self.session = session
         self.windowCandidates = windowCandidates
+        self.controlPlacementBounds = controlPlacementBounds
         self.onConfirm = onConfirm
         self.onLongScreenshot = onLongScreenshot
         self.onCancel = onCancel
@@ -862,6 +932,10 @@ private struct FreeSelectionOverlayView: View {
     var body: some View {
         GeometryReader { proxy in
             let screenBounds = CGRect(origin: .zero, size: proxy.size)
+            let placementIntersection = controlPlacementBounds.intersection(screenBounds)
+            let controlBounds = placementIntersection.isNull || placementIntersection.isEmpty
+                ? screenBounds
+                : placementIntersection
             let highlight = activeHighlight(in: screenBounds)
             let isLockedOut = session.selectedDisplayID.map { $0 != displayID } ?? false
 
@@ -962,7 +1036,11 @@ private struct FreeSelectionOverlayView: View {
                        draftSelectionStart == nil,
                        recordingCountdownValue == nil,
                        longScreenshotSession == nil {
-                        captureControls(for: highlight, in: screenBounds)
+                        captureControls(
+                            for: highlight,
+                            in: screenBounds,
+                            controlBounds: controlBounds
+                        )
                     }
 
                     if let recordingCountdownValue {
@@ -1016,6 +1094,7 @@ private struct FreeSelectionOverlayView: View {
     private func primaryGesture(in bounds: CGRect) -> some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
+                FreeSelectionOverlay.activatePanel(on: displayID)
                 guard longScreenshotSession == nil else { return }
                 if confirmedSelection == nil {
                     let distance = hypot(value.translation.width, value.translation.height)
@@ -1243,11 +1322,19 @@ private struct FreeSelectionOverlayView: View {
     }
 
     @ViewBuilder
-    private func captureControls(for selection: CGRect, in bounds: CGRect) -> some View {
+    private func captureControls(
+        for selection: CGRect,
+        in bounds: CGRect,
+        controlBounds: CGRect
+    ) -> some View {
         if purpose == .recording {
-            recordingSetupPanel(for: selection, in: bounds)
+            recordingSetupPanel(for: selection, in: bounds, controlBounds: controlBounds)
         } else {
-            let layout = screenshotToolbarLayout(for: selection, in: bounds)
+            let layout = screenshotToolbarLayout(
+                for: selection,
+                in: bounds,
+                controlBounds: controlBounds
+            )
             screenshotToolbar(at: layout.toolbarPosition, in: bounds)
 
             if expandedStyleTool != nil {
@@ -1356,9 +1443,11 @@ private struct FreeSelectionOverlayView: View {
 
     private func screenshotToolbarLayout(
         for rawSelection: CGRect,
-        in rawBounds: CGRect
+        in rawBounds: CGRect,
+        controlBounds rawControlBounds: CGRect
     ) -> ScreenshotToolbarLayout {
         let bounds = rawBounds.standardized
+        let controlBounds = rawControlBounds.standardized
         let selection = validHighlight(rawSelection, in: bounds)
         let toolbarSize = CGSize(width: 535, height: 46)
         let stylePanelSize = annotationStylePanelSize
@@ -1366,49 +1455,43 @@ private struct FreeSelectionOverlayView: View {
         let outsideGap: CGFloat = 10
         let styleGap: CGFloat = 8
         let belowY = selection.maxY + outsideGap + toolbarSize.height / 2
-        let aboveY = selection.minY - outsideGap - toolbarSize.height / 2
         let insideBottomY = selection.maxY - outsideGap - toolbarSize.height / 2
         let styleExtent = expandedStyleTool == nil ? 0 : styleGap + stylePanelSize.height
         let belowClusterFits = selection.maxY + outsideGap + toolbarSize.height + styleExtent
-            <= bounds.maxY - edgeInset
-        let aboveClusterFits = selection.minY - outsideGap - toolbarSize.height - styleExtent
-            >= bounds.minY + edgeInset
-        let toolbarY: CGFloat
-        if expandedStyleTool != nil, belowClusterFits {
-            toolbarY = belowY
-        } else if expandedStyleTool != nil, aboveClusterFits {
-            toolbarY = aboveY
-        } else if belowY <= bounds.maxY - edgeInset {
-            toolbarY = belowY
-        } else if aboveY >= bounds.minY + edgeInset {
-            toolbarY = aboveY
-        } else {
-            toolbarY = min(
-                bounds.maxY - toolbarSize.height / 2 - edgeInset,
-                max(bounds.minY + toolbarSize.height / 2 + edgeInset, insideBottomY)
+            <= controlBounds.maxY - edgeInset
+        // Controls stay directly below the selection. When the Dock or a
+        // display edge consumes that space, place them against the inner
+        // bottom edge instead of jumping above or sitting behind the Dock.
+        let toolbarY = belowClusterFits
+            ? belowY
+            : min(
+                controlBounds.maxY - toolbarSize.height / 2 - edgeInset,
+                max(controlBounds.minY + toolbarSize.height / 2 + edgeInset, insideBottomY)
             )
-        }
 
         let isFullScreenSelection = abs(selection.width - bounds.width) < 1
             && abs(selection.height - bounds.height) < 1
         let toolbarX: CGFloat
         if isFullScreenSelection {
-            toolbarX = bounds.midX
+            toolbarX = controlBounds.midX
         } else {
             toolbarX = min(
-                bounds.maxX - toolbarSize.width / 2 - edgeInset,
-                max(toolbarSize.width / 2 + edgeInset, selection.maxX - toolbarSize.width / 2)
+                controlBounds.maxX - toolbarSize.width / 2 - edgeInset,
+                max(
+                    controlBounds.minX + toolbarSize.width / 2 + edgeInset,
+                    selection.maxX - toolbarSize.width / 2
+                )
             )
         }
-        let styleX = stylePanelX(toolbarX: toolbarX, bounds: bounds)
+        let styleX = stylePanelX(toolbarX: toolbarX, bounds: controlBounds)
         let styleY = toolbarY + stylePanelOffset(
             toolbarY: toolbarY,
             selection: selection,
-            bounds: bounds
+            bounds: controlBounds
         )
         let clampedStyleY = min(
-            bounds.maxY - stylePanelSize.height / 2 - edgeInset,
-            max(bounds.minY + stylePanelSize.height / 2 + edgeInset, styleY)
+            controlBounds.maxY - stylePanelSize.height / 2 - edgeInset,
+            max(controlBounds.minY + stylePanelSize.height / 2 + edgeInset, styleY)
         )
         return ScreenshotToolbarLayout(
             toolbarPosition: CGPoint(x: toolbarX, y: toolbarY),
@@ -1417,7 +1500,11 @@ private struct FreeSelectionOverlayView: View {
     }
 
     @ViewBuilder
-    private func recordingSetupPanel(for selection: CGRect, in bounds: CGRect) -> some View {
+    private func recordingSetupPanel(
+        for selection: CGRect,
+        in bounds: CGRect,
+        controlBounds: CGRect
+    ) -> some View {
         let panelSize = CGSize(width: 940, height: 208)
         let edgeInset: CGFloat = 8
         let outsideGap: CGFloat = 10
@@ -1426,19 +1513,19 @@ private struct FreeSelectionOverlayView: View {
         // Recording controls belong below the selected area. Keep them outside
         // whenever the full panel fits; otherwise tuck the same panel against
         // the selection's inner bottom edge. Never jump it above the selection.
-        let panelY: CGFloat = if belowY + panelSize.height / 2 <= bounds.maxY - edgeInset {
+        let panelY: CGFloat = if belowY + panelSize.height / 2 <= controlBounds.maxY - edgeInset {
             belowY
         } else {
             min(
-                bounds.maxY - panelSize.height / 2 - edgeInset,
-                max(bounds.minY + panelSize.height / 2 + edgeInset, insideBottomY)
+                controlBounds.maxY - panelSize.height / 2 - edgeInset,
+                max(controlBounds.minY + panelSize.height / 2 + edgeInset, insideBottomY)
             )
         }
         // Keep the recording controls centered directly below the selection.
         // Only shift horizontally when the panel would cross a display edge.
         let panelX = min(
-            bounds.maxX - panelSize.width / 2 - edgeInset,
-            max(bounds.minX + panelSize.width / 2 + edgeInset, selection.midX)
+            controlBounds.maxX - panelSize.width / 2 - edgeInset,
+            max(controlBounds.minX + panelSize.width / 2 + edgeInset, selection.midX)
         )
 
         RecordingSetupPanelView(

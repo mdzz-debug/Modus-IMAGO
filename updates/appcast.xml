@@ -20,7 +20,7 @@
 
 首次从 0.1.0 升级到 0.1.1 仍需手动安装；从 0.1.1 开始，后续版本可自动更新。
 ]]></description>
-            <enclosure url="https://github.com/mdzz-debug/Modus-IMAGO/releases/download/v0.1.1/M-Imago-v0.1.1-arm64.zip" length="5596288" type="application/octet-stream" sparkle:edSignature="GXw9H1caXkg85Cssj2KCn0d7uuSTjKr6kq5r80KyN3f8Yz/vXXHGLfqtDADIAxwgOGg4lkep6nfDjcQyX9c7Bw=="/>
+            <enclosure url="https://github.com/mdzz-debug/Modus-IMAGO/releases/download/v0.1.1/M-Imago-v0.1.1-arm64.zip" length="5598883" type="application/octet-stream" sparkle:edSignature="iOtPguEPEgnBNP+5qCUGBC7bqCo/IZpo9hQ4hLwWGDUgVVWX5q/L6dJORXc4ODE0d5OhnF63ZnKNnjz55CfYCQ=="/>
         </item>
     </channel>
 </rss>
