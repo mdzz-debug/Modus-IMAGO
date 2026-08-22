@@ -200,6 +200,11 @@ private final class CaptureOverlayPanel: NSPanel {
 
     override func sendEvent(_ event: NSEvent) {
         if event.type == .keyDown, event.keyCode == 53 {
+            DiagnosticLogStore.shared.log(
+                .debug,
+                category: "capture-overlay",
+                "escape-received source=panel-send-event"
+            )
             onCancelRequested?()
             return
         }
@@ -222,6 +227,11 @@ private final class CaptureOverlayPanel: NSPanel {
     }
 
     override func cancelOperation(_ sender: Any?) {
+        DiagnosticLogStore.shared.log(
+            .debug,
+            category: "capture-overlay",
+            "escape-received source=cancel-operation"
+        )
         onCancelRequested?()
     }
 
@@ -446,7 +456,14 @@ enum FreeSelectionOverlay {
         }
         escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             guard event.keyCode == 53 else { return event }
-            Task { @MainActor in cancel() }
+            Task { @MainActor in
+                DiagnosticLogStore.shared.log(
+                    .debug,
+                    category: "capture-overlay",
+                    "escape-received source=local-monitor"
+                )
+                cancel()
+            }
             return nil
         }
         globalEscapeMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { event in

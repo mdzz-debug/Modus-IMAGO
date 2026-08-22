@@ -3,24 +3,24 @@
     <channel>
         <title>M · Imago</title>
         <item>
-            <title>0.1.1</title>
-            <pubDate>Sat, 22 Aug 2026 15:44:08 +0800</pubDate>
-            <link>https://github.com/mdzz-debug/Modus-IMAGO/releases/tag/v0.1.1</link>
-            <sparkle:version>2</sparkle:version>
-            <sparkle:shortVersionString>0.1.1</sparkle:shortVersionString>
+            <title>0.1.2</title>
+            <pubDate>Sat, 22 Aug 2026 18:38:12 +0800</pubDate>
+            <link>https://github.com/mdzz-debug/Modus-IMAGO/releases/tag/v0.1.2</link>
+            <sparkle:version>3</sparkle:version>
+            <sparkle:shortVersionString>0.1.2</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description sparkle:format="markdown"><![CDATA[# M · Imago 0.1.1
+            <description sparkle:format="markdown"><![CDATA[# M · Imago 0.1.2
 
-- 增加 Sparkle 应用内自动更新。
-- 通用面板增加“每天自动检查更新”开关。
-- 发现新版本后直接在应用内显示版本说明和下载进度。
-- 下载完成后自动替换应用并重新启动，不再要求前往 GitHub 手动安装。
-- 修复 GitHub API 临时返回 HTTP 403 时无法检查更新的问题。
+- 修复副显示器中的应用进入 macOS 原生全屏后无法选择该屏幕的问题。
+- 修复副屏点击穿透后截图会话无法结束的问题。
+- 修复选中窗口后 Esc 偶尔无法退出截图的问题。
+- 截图和录屏工具栏会避开 Dock；Dock 保持显示并仍可包含在截图中。
+- 优化多屏全屏 Space 中遮罩窗口的层级和键盘焦点。
 
-首次从 0.1.0 升级到 0.1.1 仍需手动安装；从 0.1.1 开始，后续版本可自动更新。
+此版本用于验证从 0.1.1 到 0.1.2 的 Sparkle 应用内更新流程。
 ]]></description>
-            <enclosure url="https://github.com/mdzz-debug/Modus-IMAGO/releases/download/v0.1.1/M-Imago-v0.1.1-arm64.zip" length="5598883" type="application/octet-stream" sparkle:edSignature="iOtPguEPEgnBNP+5qCUGBC7bqCo/IZpo9hQ4hLwWGDUgVVWX5q/L6dJORXc4ODE0d5OhnF63ZnKNnjz55CfYCQ=="/>
+            <enclosure url="https://github.com/mdzz-debug/Modus-IMAGO/releases/download/v0.1.2/M-Imago-v0.1.2-arm64.zip" length="5598979" type="application/octet-stream" sparkle:edSignature="mR+gBiNlH575b2aohLHoQD81zf3T51qDirjtmt4E2/5lmgZmP4hSR8dsonvs7zz0NolYScJtYA6/5ZqqzRarCQ=="/>
         </item>
     </channel>
 </rss>
