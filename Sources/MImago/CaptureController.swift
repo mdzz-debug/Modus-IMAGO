@@ -5,7 +5,7 @@ import CoreText
 import FormaUI
 import Foundation
 import ScreenCaptureKit
-import VideoToolbox
+import Vision
 
 @MainActor
 final class MImagoPermissions {
@@ -126,8 +126,226 @@ private struct LongScreenshotFrameUpdate: @unchecked Sendable {
     let shift: Int
 }
 
+private enum LongScreenshotOffsetEstimateSource {
+    case bandConsensus
+    case validatedBandFallback
+    case fullFrameFallback
+}
+
+private struct LongScreenshotOffsetEstimate {
+    let translation: CGPoint
+    let confidence: Float
+    let source: LongScreenshotOffsetEstimateSource
+}
+
+private struct LongScreenshotImageTranslation {
+    let x: CGFloat
+    let y: CGFloat
+    let confidence: Float
+}
+
+/// Vision-based translation matching adapted from ScrollSnap's MIT-licensed
+/// StitchingManager. Requiring agreement across several horizontal bands keeps
+/// repeated chat bubbles, fixed headers, and composers from deciding the seam.
+private struct LongScreenshotVisionOffsetEstimator {
+    private let comparisonBandCount = 5
+    private let minimumComparisonBandHeight = 80
+    private let agreementTolerance: CGFloat = 3
+    private let maximumHorizontalMovement: CGFloat = 3
+    private let minimumOverlapFraction: CGFloat = 0.15
+    private let validatedBandConfidence: Float = 0.8
+    private let fullFrameConfidence: Float = 0.9
+
+    func estimate(
+        from currentImage: CGImage,
+        to previousImage: CGImage
+    ) -> LongScreenshotOffsetEstimate? {
+        guard currentImage.width == previousImage.width,
+              currentImage.height == previousImage.height else {
+            return nil
+        }
+
+        let frameHeight = CGFloat(currentImage.height)
+        let bandTranslations = comparisonBands(for: currentImage).compactMap {
+            band -> LongScreenshotImageTranslation? in
+            guard let currentBand = currentImage.cropping(to: band),
+                  let previousBand = previousImage.cropping(to: band),
+                  let translation = findTranslation(
+                    from: currentBand,
+                    to: previousBand
+                  ),
+                  isValid(translation, frameHeight: frameHeight) else {
+                return nil
+            }
+            return translation
+        }
+
+        if let consensus = bestGroup(in: bandTranslations, minimumCount: 4) {
+            return makeEstimate(from: consensus, source: .bandConsensus)
+        }
+
+        return resolve(
+            bandTranslations: bandTranslations,
+            fullFrameTranslation: findTranslation(
+                from: currentImage,
+                to: previousImage
+            ),
+            frameHeight: frameHeight
+        )
+    }
+
+    private func resolve(
+        bandTranslations: [LongScreenshotImageTranslation],
+        fullFrameTranslation: LongScreenshotImageTranslation?,
+        frameHeight: CGFloat
+    ) -> LongScreenshotOffsetEstimate? {
+        let validBands = bandTranslations.filter {
+            isValid($0, frameHeight: frameHeight)
+        }
+        if let consensus = bestGroup(in: validBands, minimumCount: 4) {
+            return makeEstimate(from: consensus, source: .bandConsensus)
+        }
+
+        guard let fullFrameTranslation,
+              isValid(fullFrameTranslation, frameHeight: frameHeight) else {
+            return nil
+        }
+        if fullFrameTranslation.confidence >= validatedBandConfidence,
+           let partialConsensus = bestGroup(in: validBands, minimumCount: 3),
+           let bandOffset = average(partialConsensus),
+           abs(bandOffset.y - fullFrameTranslation.y) <= agreementTolerance {
+            return LongScreenshotOffsetEstimate(
+                translation: CGPoint(x: bandOffset.x, y: bandOffset.y),
+                confidence: min(
+                    bandOffset.confidence,
+                    fullFrameTranslation.confidence
+                ),
+                source: .validatedBandFallback
+            )
+        }
+
+        guard fullFrameTranslation.confidence >= fullFrameConfidence else {
+            return nil
+        }
+        return LongScreenshotOffsetEstimate(
+            translation: CGPoint(
+                x: fullFrameTranslation.x,
+                y: fullFrameTranslation.y
+            ),
+            confidence: fullFrameTranslation.confidence,
+            source: .fullFrameFallback
+        )
+    }
+
+    private func comparisonBands(for image: CGImage) -> [CGRect] {
+        let imageHeight = image.height
+        guard image.width > 0, imageHeight > 0 else { return [] }
+
+        let bandHeight = min(
+            imageHeight,
+            max(minimumComparisonBandHeight, imageHeight / 3)
+        )
+        let maximumOriginY = max(0, imageHeight - bandHeight)
+        let origins: [Int]
+        if maximumOriginY == 0 {
+            origins = [0]
+        } else {
+            origins = (0..<comparisonBandCount).map { index in
+                let denominator = max(1, comparisonBandCount - 1)
+                return Int(
+                    (CGFloat(maximumOriginY) * CGFloat(index)
+                        / CGFloat(denominator)).rounded()
+                )
+            }
+        }
+        return Array(Set(origins)).sorted().map { originY in
+            CGRect(
+                x: 0,
+                y: originY,
+                width: image.width,
+                height: bandHeight
+            )
+        }
+    }
+
+    private func bestGroup(
+        in translations: [LongScreenshotImageTranslation],
+        minimumCount: Int
+    ) -> [LongScreenshotImageTranslation]? {
+        var bestGroup: [LongScreenshotImageTranslation] = []
+        for translation in translations {
+            let group = translations.filter {
+                abs($0.y - translation.y) <= agreementTolerance
+            }
+            if group.count > bestGroup.count {
+                bestGroup = group
+            }
+        }
+        return bestGroup.count >= minimumCount ? bestGroup : nil
+    }
+
+    private func makeEstimate(
+        from translations: [LongScreenshotImageTranslation],
+        source: LongScreenshotOffsetEstimateSource
+    ) -> LongScreenshotOffsetEstimate? {
+        guard let translation = average(translations) else { return nil }
+        return LongScreenshotOffsetEstimate(
+            translation: CGPoint(x: translation.x, y: translation.y),
+            confidence: translation.confidence,
+            source: source
+        )
+    }
+
+    private func average(
+        _ translations: [LongScreenshotImageTranslation]
+    ) -> LongScreenshotImageTranslation? {
+        guard !translations.isEmpty else { return nil }
+        let count = CGFloat(translations.count)
+        return LongScreenshotImageTranslation(
+            x: translations.reduce(0) { $0 + $1.x } / count,
+            y: translations.reduce(0) { $0 + $1.y } / count,
+            confidence: translations.reduce(0) { $0 + $1.confidence }
+                / Float(translations.count)
+        )
+    }
+
+    private func isValid(
+        _ translation: LongScreenshotImageTranslation,
+        frameHeight: CGFloat
+    ) -> Bool {
+        let maximumVerticalMovement = frameHeight * (1 - minimumOverlapFraction)
+        return abs(translation.x) <= maximumHorizontalMovement
+            && abs(translation.y) <= maximumVerticalMovement
+    }
+
+    private func findTranslation(
+        from currentImage: CGImage,
+        to previousImage: CGImage
+    ) -> LongScreenshotImageTranslation? {
+        let request = VNTranslationalImageRegistrationRequest(
+            targetedCGImage: previousImage
+        )
+        let handler = VNImageRequestHandler(cgImage: currentImage, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            return nil
+        }
+        guard let observation = request.results?.first
+            as? VNImageTranslationAlignmentObservation else {
+            return nil
+        }
+        return LongScreenshotImageTranslation(
+            x: observation.alignmentTransform.tx,
+            y: observation.alignmentTransform.ty,
+            confidence: observation.confidence
+        )
+    }
+}
+
 private final class LongScreenshotFrameProcessor: @unchecked Sendable {
     private let lock = NSLock()
+    private let offsetEstimator = LongScreenshotVisionOffsetEstimator()
     private var firstFrame: CGImage?
     private var lastFrame: CGImage?
     private var appendedStrips: [CGImage] = []
@@ -157,10 +375,21 @@ private final class LongScreenshotFrameProcessor: @unchecked Sendable {
             )
         }
 
-        let shift = try CaptureController.detectedVerticalShift(
-            from: previous,
-            to: captured
-        )
+        guard let estimate = offsetEstimator.estimate(
+            from: captured,
+            to: previous
+        ) else {
+            return nil
+        }
+        let translatedY = estimate.translation.y
+        if abs(translatedY) <= 3 {
+            lastFrame = captured
+            return nil
+        }
+        // A negative translation means the user reversed direction. Keeping the
+        // last accepted reference avoids corrupting an already assembled image.
+        guard translatedY > 0 else { return nil }
+        let shift = Int(translatedY.rounded())
         if shift >= 2 {
             let stripHeight = min(shift, captured.height)
             guard let strip = CaptureController.copiedRegion(
@@ -235,7 +464,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
     }
 
     @MainActor
-    final class ManualLongScreenshotSession: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegate {
+    final class ManualLongScreenshotSession: NSObject, ObservableObject {
         @Published private(set) var previewImage: CGImage?
         @Published private(set) var capturedFrameCount = 0
         @Published private(set) var isCapturing = false
@@ -247,20 +476,17 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
             qos: .userInitiated
         )
         private nonisolated let frameProcessor = LongScreenshotFrameProcessor()
-        private var stream: SCStream?
+        private var captureTask: Task<Void, Never>?
         private var isStopped = false
-        private var globalScrollMonitor: Any?
-        private var localScrollMonitor: Any?
-        private var scrollCaptureTask: Task<Void, Never>?
-        private var snapshotPollingTask: Task<Void, Never>?
-        private var isSnapshotCaptureInFlight = false
 
         init(source: ManualLongScreenshotSource) {
             self.source = source
         }
 
         func start() {
-            guard !frameProcessor.hasFrames, stream == nil, !isCapturing else { return }
+            guard !frameProcessor.hasFrames,
+                  captureTask == nil,
+                  !isCapturing else { return }
             isCapturing = true
             errorMessage = nil
             DiagnosticLogStore.shared.log(
@@ -268,7 +494,7 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
                 category: "long-screenshot",
                 "manual-session-start source=\(sourceDescription)"
             )
-            Task { @MainActor [weak self] in
+            captureTask = Task { @MainActor [weak self] in
                 guard let self else { return }
                 do {
                     CaptureController.prepareManualLongScreenshotSource(source)
@@ -277,31 +503,26 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
                         source: source
                     )
                     guard !isStopped else { return }
-
-                    let stream = SCStream(
-                        filter: filter,
-                        configuration: configuration,
-                        delegate: self
-                    )
-                    try stream.addStreamOutput(
-                        self,
-                        type: .screen,
-                        sampleHandlerQueue: frameQueue
-                    )
-                    self.stream = stream
-                    try await stream.startCapture()
-                    guard !isStopped else {
-                        try? await stream.stopCapture()
-                        return
-                    }
-                    installScrollMonitors()
-                    scheduleSnapshotCapture(after: .milliseconds(60))
-                    startSnapshotPolling()
                     DiagnosticLogStore.shared.log(
                         .info,
                         category: "long-screenshot",
-                        "manual-frame-stream-ready source=\(sourceDescription)"
+                        "manual-frame-capture-ready source=\(sourceDescription)"
                     )
+                    var isFirstFrame = true
+                    while !Task.isCancelled, !isStopped {
+                        let image = try await SCScreenshotManager.captureImage(
+                            contentFilter: filter,
+                            configuration: configuration
+                        )
+                        await processCapturedImageInOrder(image)
+                        if isFirstFrame {
+                            isFirstFrame = false
+                            isCapturing = false
+                        }
+                        try await Task.sleep(for: .milliseconds(250))
+                    }
+                } catch is CancellationError {
+                    // Normal when the user finishes or cancels the session.
                 } catch {
                     errorMessage = error.localizedDescription
                     DiagnosticLogStore.shared.log(
@@ -311,29 +532,15 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
                     )
                 }
                 isCapturing = false
+                captureTask = nil
             }
         }
 
         func stop() {
             isStopped = true
             isCapturing = false
-            scrollCaptureTask?.cancel()
-            scrollCaptureTask = nil
-            snapshotPollingTask?.cancel()
-            snapshotPollingTask = nil
-            if let globalScrollMonitor {
-                NSEvent.removeMonitor(globalScrollMonitor)
-                self.globalScrollMonitor = nil
-            }
-            if let localScrollMonitor {
-                NSEvent.removeMonitor(localScrollMonitor)
-                self.localScrollMonitor = nil
-            }
-            let activeStream = stream
-            stream = nil
-            if let activeStream {
-                Task { try? await activeStream.stopCapture() }
-            }
+            captureTask?.cancel()
+            captureTask = nil
             DiagnosticLogStore.shared.log(
                 .debug,
                 category: "long-screenshot",
@@ -342,38 +549,12 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         }
 
         func finishedImage() -> CGImage? {
-            frameProcessor.finishedImage()
-        }
-
-        nonisolated func stream(
-            _ stream: SCStream,
-            didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
-            of type: SCStreamOutputType
-        ) {
-            guard type == .screen,
-                  sampleBuffer.isValid,
-                  sampleBuffer.dataReadiness == .ready,
-                  let attachments = CMSampleBufferGetSampleAttachmentsArray(
-                    sampleBuffer,
-                    createIfNecessary: false
-                  ) as? [[SCStreamFrameInfo: Any]],
-                  let statusValue = attachments.first?[.status] as? Int,
-                  SCFrameStatus(rawValue: statusValue) == .complete,
-                  let pixelBuffer = sampleBuffer.imageBuffer else { return }
-
-            var image: CGImage?
-            guard VTCreateCGImageFromCVPixelBuffer(
-                pixelBuffer,
-                options: nil,
-                imageOut: &image
-            ) == noErr,
-                  let image else { return }
-
-            processCapturedImage(image)
+            frameQueue.sync {
+                frameProcessor.finishedImage()
+            }
         }
 
         nonisolated private func processCapturedImage(_ image: CGImage) {
-
             do {
                 guard let update = try frameProcessor.consume(image) else { return }
                 Task { @MainActor [weak self] in
@@ -386,85 +567,12 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
             }
         }
 
-        private func installScrollMonitors() {
-            guard globalScrollMonitor == nil,
-                  localScrollMonitor == nil else { return }
-
-            globalScrollMonitor = NSEvent.addGlobalMonitorForEvents(
-                matching: .scrollWheel
-            ) { [weak self] event in
-                guard abs(event.scrollingDeltaY) > 0.01 else { return }
-                Task { @MainActor [weak self] in
-                    self?.scheduleSnapshotCapture(after: .milliseconds(95))
-                }
-            }
-            localScrollMonitor = NSEvent.addLocalMonitorForEvents(
-                matching: .scrollWheel
-            ) { [weak self] event in
-                if abs(event.scrollingDeltaY) > 0.01 {
-                    Task { @MainActor [weak self] in
-                        self?.scheduleSnapshotCapture(after: .milliseconds(95))
-                    }
-                }
-                return event
-            }
-        }
-
-        private func scheduleSnapshotCapture(after delay: Duration) {
-            guard !isStopped else { return }
-            scrollCaptureTask?.cancel()
-            scrollCaptureTask = Task { @MainActor [weak self] in
-                do {
-                    try await Task.sleep(for: delay)
-                } catch {
-                    return
-                }
-                await self?.captureSnapshotAfterScroll()
-            }
-        }
-
-        private func startSnapshotPolling() {
-            snapshotPollingTask?.cancel()
-            snapshotPollingTask = Task { @MainActor [weak self] in
-                while let self, !Task.isCancelled, !self.isStopped {
-                    do {
-                        try await Task.sleep(for: .milliseconds(320))
-                    } catch {
-                        return
-                    }
-                    await self.captureSnapshotAfterScroll()
-                }
-            }
-        }
-
-        private func captureSnapshotAfterScroll() async {
-            guard !isStopped,
-                  !isSnapshotCaptureInFlight else { return }
-            isSnapshotCaptureInFlight = true
-            defer { isSnapshotCaptureInFlight = false }
-
-            do {
-                let image = try await CaptureController.captureManualLongScreenshotFrame(
-                    source: source
-                )
+        private func processCapturedImageInOrder(_ image: CGImage) async {
+            await withCheckedContinuation { continuation in
                 frameQueue.async { [weak self] in
                     self?.processCapturedImage(image)
+                    continuation.resume()
                 }
-            } catch {
-                reportFrameError(error)
-            }
-        }
-
-        nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
-            Task { @MainActor [weak self] in
-                guard let self, !isStopped else { return }
-                isCapturing = false
-                errorMessage = error.localizedDescription
-                DiagnosticLogStore.shared.log(
-                    .warning,
-                    category: "long-screenshot",
-                    "manual-frame-stream-stopped error=\(error.localizedDescription)"
-                )
             }
         }
 
@@ -1150,24 +1258,12 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         configuration.scalesToFit = true
         configuration.preservesAspectRatio = true
         configuration.captureResolution = .best
-        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 6)
-        configuration.queueDepth = 2
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 12)
+        configuration.queueDepth = 3
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.showsCursor = false
         configuration.capturesAudio = false
         return (filter, configuration)
-    }
-
-    nonisolated private static func captureManualLongScreenshotFrame(
-        source: ManualLongScreenshotSource
-    ) async throws -> CGImage {
-        let (filter, configuration) = try await longScreenshotStreamConfiguration(
-            source: source
-        )
-        return try await SCScreenshotManager.captureImage(
-            contentFilter: filter,
-            configuration: configuration
-        )
     }
 
     private static func windowCandidates(for screen: NSScreen) -> [CaptureWindowCandidate] {
@@ -1777,178 +1873,15 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
         from previous: CGImage,
         to next: CGImage
     ) throws -> Int {
-        let commonWidth = max(1, min(previous.width, next.width))
-        let commonHeight = max(1, min(previous.height, next.height))
-        let sampleWidth = min(240, commonWidth)
-        let scale = CGFloat(sampleWidth) / CGFloat(commonWidth)
-        let sampleHeight = max(48, Int((CGFloat(commonHeight) * scale).rounded()))
-        let previousPixels = try topDownRGBABytes(
-            previous,
-            width: sampleWidth,
-            height: sampleHeight
-        )
-        let nextPixels = try topDownRGBABytes(
-            next,
-            width: sampleWidth,
-            height: sampleHeight
-        )
-
-        let horizontalInset = max(3, sampleWidth / 32)
-        let topInset = max(4, sampleHeight / 12)
-        let bottomInset = max(4, sampleHeight / 10)
-        let xStep = max(2, sampleWidth / 72)
-        let yStep = max(2, sampleHeight / 96)
-
-        func score(
-            for shift: Int,
-            from startX: Int,
-            to endX: Int
-        ) -> (difference: Double, texturedSamples: Int, totalSamples: Int) {
-            let endY = sampleHeight - bottomInset - shift
-            guard endY - topInset >= 12,
-                  endX - startX >= xStep * 2 else {
-                return (.greatestFiniteMagnitude, 0, 0)
-            }
-            var difference: UInt64 = 0
-            var weightedSamples: UInt64 = 0
-            var texturedSamples = 0
-            var totalSamples = 0
-            var y = topInset
-            while y < endY {
-                var x = startX
-                while x < endX - xStep {
-                    let previousIndex = ((y + shift) * sampleWidth + x) * 4
-                    let nextIndex = (y * sampleWidth + x) * 4
-                    let previousNeighbor = previousIndex + xStep * 4
-                    let nextNeighbor = nextIndex + xStep * 4
-                    let detail =
-                        abs(Int(previousPixels[previousIndex]) - Int(previousPixels[previousNeighbor])) +
-                        abs(Int(previousPixels[previousIndex + 1]) - Int(previousPixels[previousNeighbor + 1])) +
-                        abs(Int(previousPixels[previousIndex + 2]) - Int(previousPixels[previousNeighbor + 2])) +
-                        abs(Int(nextPixels[nextIndex]) - Int(nextPixels[nextNeighbor])) +
-                        abs(Int(nextPixels[nextIndex + 1]) - Int(nextPixels[nextNeighbor + 1])) +
-                        abs(Int(nextPixels[nextIndex + 2]) - Int(nextPixels[nextNeighbor + 2]))
-                    let weight = detail >= 18 ? 4 : 1
-                    if detail >= 18 { texturedSamples += 1 }
-                    totalSamples += 1
-                    difference += UInt64(weight * (
-                        abs(Int(previousPixels[previousIndex]) - Int(nextPixels[nextIndex])) +
-                        abs(Int(previousPixels[previousIndex + 1]) - Int(nextPixels[nextIndex + 1])) +
-                        abs(Int(previousPixels[previousIndex + 2]) - Int(nextPixels[nextIndex + 2]))
-                    ))
-                    weightedSamples += UInt64(weight * 3)
-                    x += xStep
-                }
-                y += yStep
-            }
-            guard weightedSamples > 0 else {
-                return (.greatestFiniteMagnitude, 0, totalSamples)
-            }
-            return (
-                Double(difference) / Double(weightedSamples),
-                texturedSamples,
-                totalSamples
-            )
-        }
-
-        let minimumShift = max(1, sampleHeight / 180)
-        let maximumShift = max(
-            minimumShift,
-            min(
-                sampleHeight - topInset - bottomInset - 12,
-                Int(CGFloat(sampleHeight) * 0.82)
-            )
-        )
-
-        // Desktop chat and browser windows often keep a sidebar, header, or
-        // composer fixed while only the central content column moves. Scoring
-        // the complete width lets those stationary pixels drown out the real
-        // scroll. Evaluate several overlapping vertical bands and trust the
-        // strongest textured band instead.
-        let usableStartX = horizontalInset
-        let usableEndX = sampleWidth - horizontalInset
-        let usableWidth = max(1, usableEndX - usableStartX)
-        let bandWidth = min(
-            usableWidth,
-            max(xStep * 6, Int((Double(usableWidth) * 0.46).rounded()))
-        )
-        let remainingWidth = max(0, usableWidth - bandWidth)
-        let bandStarts = (0..<4).map { index in
-            usableStartX + Int(
-                (Double(remainingWidth) * Double(index) / 3).rounded()
-            )
-        }
-
-        var strongestShift = 0
-        var strongestConfidence = -Double.greatestFiniteMagnitude
-        for bandStart in bandStarts {
-            let bandEnd = min(usableEndX, bandStart + bandWidth)
-            let samePosition = score(
-                for: 0,
-                from: bandStart,
-                to: bandEnd
-            )
-            guard samePosition.difference >= 0.8,
-                  samePosition.texturedSamples >= max(8, samePosition.totalSamples / 40) else {
-                continue
-            }
-
-            var bestShift = 0
-            var bestScore = Double.greatestFiniteMagnitude
-            for shift in minimumShift...maximumShift {
-                let candidate = score(
-                    for: shift,
-                    from: bandStart,
-                    to: bandEnd
-                )
-                if candidate.difference < bestScore {
-                    bestScore = candidate.difference
-                    bestShift = shift
-                }
-            }
-
-            guard bestShift > 0,
-                  bestScore < 24,
-                  bestScore + 0.35 < samePosition.difference
-                    || bestScore < samePosition.difference * 0.82 else {
-                continue
-            }
-            let ratio = bestScore / max(0.001, samePosition.difference)
-            let confidence = (samePosition.difference - bestScore)
-                + max(0, 1 - ratio) * 10
-                + min(4, Double(samePosition.texturedSamples) / 120)
-            if confidence > strongestConfidence {
-                strongestConfidence = confidence
-                strongestShift = bestShift
-            }
-        }
-
-        guard strongestShift > 0 else { return 0 }
-        return max(1, Int((CGFloat(strongestShift) / scale).rounded()))
-    }
-
-    nonisolated private static func topDownRGBABytes(
-        _ image: CGImage,
-        width: Int,
-        height: Int
-    ) throws -> [UInt8] {
-        var bytes = [UInt8](repeating: 0, count: width * height * 4)
-        guard let context = CGContext(
-            data: &bytes,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: width * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        guard let estimate = LongScreenshotVisionOffsetEstimator().estimate(
+            from: next,
+            to: previous
         ) else {
-            throw CaptureError.imageEncodingFailed
+            return 0
         }
-        context.interpolationQuality = .low
-        context.translateBy(x: 0, y: CGFloat(height))
-        context.scaleBy(x: 1, y: -1)
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-        return bytes
+        let shift = estimate.translation.y
+        guard shift > 3 else { return 0 }
+        return Int(shift.rounded())
     }
 
     nonisolated private static func raiseWindow(windowID: CGWindowID, processID: pid_t) {
