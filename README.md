@@ -25,6 +25,18 @@ zsh scripts/package-app.sh
 .build/M-Imago.app
 ```
 
+## 朋友版发布
+
+正式发布包继续使用 `Modus App Signing - com.modus.imago` 本地证书签名，接收者需先安装并信任 DMG 中附带的 `Modus Friends Root CA`。
+
+生成 Release 构建、DMG、ZIP 和 SHA-256 校验文件：
+
+```bash
+zsh scripts/build-release.sh 0.1.0 1
+```
+
+产物位于 `dist/v0.1.0/`。在 GitHub 创建正式 Release，标签必须使用与 App 版本对应的 `v0.1.0`，并上传 DMG、ZIP 和 `SHA256SUMS.txt`。应用内“通用 → 应用信息 → 检查更新”会读取最新的正式 GitHub Release；草稿和预发布版本不会提示。
+
 ## 诊断日志
 
 运行日志会自动轮换保存在：

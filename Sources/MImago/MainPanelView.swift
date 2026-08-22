@@ -804,6 +804,21 @@ private struct ApplicationInfoSettings: View {
                 FormaFormRow("版本", detail: "M · IMAGO", size: .small) {
                     FormaBadge(version, tone: .success, size: .small)
                 }
+                FormaSectionDivider()
+                FormaFormRow(
+                    "软件更新",
+                    detail: "从 GitHub Releases 检查新版本",
+                    size: .small
+                ) {
+                    FormaButton(
+                        "检查更新",
+                        systemImage: "arrow.triangle.2.circlepath",
+                        role: .secondary,
+                        size: .small
+                    ) {
+                        UpdateController.shared.checkForUpdates()
+                    }
+                }
             }
         }
     }

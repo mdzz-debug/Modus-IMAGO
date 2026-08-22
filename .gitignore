@@ -3,6 +3,7 @@
 .swiftpm/
 .codegraph/
 DerivedData/
+dist/
 xcuserdata/
 *.xcuserstate
 *.dmg
