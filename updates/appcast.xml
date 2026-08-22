@@ -29,7 +29,7 @@
 
 此版本用于验证从 0.1.1 到 0.1.2 的 Sparkle 应用内更新流程。
 ]]></description>
-            <enclosure url="https://github.com/mdzz-debug/Modus-IMAGO/releases/download/v0.1.2/M-Imago-v0.1.2-arm64.zip" length="5616912" type="application/octet-stream" sparkle:edSignature="3QorjFtN7bz2vpSxoM38Jg5B5iWx93VCaacvSbUqA0SCmsnUpBcxPyG8aFbKbDsvNyFKyggBculFNv8mqR1iDw=="/>
+            <enclosure url="https://github.com/mdzz-debug/Modus-IMAGO/releases/download/v0.1.2/M-Imago-v0.1.2-arm64.zip" length="5616911" type="application/octet-stream" sparkle:edSignature="tuYhYAHk+9zA+6+kYhWe4K3CUoKlsKKXTB8KmqyOOj+NcBPEQ3RRgMBgf5z9A+52S8N7WVW8SdrquKGLo52dDg=="/>
         </item>
     </channel>
 </rss>
