@@ -2505,15 +2505,15 @@ private struct FreeSelectionOverlayView: View {
         guard purpose == .screenshot,
               let selection else { return }
 
-        let candidates: [(CaptureWindowCandidate, CGRect)]
+        let targetCandidate: (CaptureWindowCandidate, CGRect)?
         switch selection {
         case let .window(candidate):
-            candidates = [(
+            targetCandidate = (
                 candidate,
                 CGRect(origin: .zero, size: candidate.frame.size)
-            )]
+            )
         case let .region(rect):
-            candidates = windowCandidates.compactMap { candidate in
+            let overlappingCandidates = windowCandidates.compactMap { candidate -> (CaptureWindowCandidate, CGRect)? in
                 let overlap = candidate.frame.intersection(rect)
                 guard !overlap.isNull,
                       overlap.width >= 60,
@@ -2528,11 +2528,15 @@ private struct FreeSelectionOverlayView: View {
                     )
                 )
             }
-            .sorted { lhs, rhs in
-                lhs.1.width * lhs.1.height > rhs.1.width * rhs.1.height
-            }
+            // CGWindowListCopyWindowInfo returns windows from front to back.
+            // Keep that order and bind the selection to one visible window only:
+            // falling through to a larger background window can make an unrelated
+            // app appear in front when long screenshot capture starts.
+            targetCandidate = overlappingCandidates.first(where: { candidate, _ in
+                candidate.frame.contains(CGPoint(x: rect.midX, y: rect.midY))
+            }) ?? overlappingCandidates.first
         }
-        guard !candidates.isEmpty else { return }
+        guard let targetCandidate else { return }
 
         isCheckingLongScreenshotAvailability = true
         longScreenshotAvailabilityTask = Task { @MainActor in
@@ -2544,16 +2548,12 @@ private struct FreeSelectionOverlayView: View {
             let resolved = await Task.detached(
                 priority: .userInitiated
             ) { () -> CaptureController.ManualLongScreenshotScrollTarget? in
-                for (candidate, selectionFrame) in candidates {
-                    if let target = CaptureController.manualLongScreenshotTarget(
-                        windowID: candidate.windowID,
-                        processID: candidate.processID,
-                        selectionFrame: selectionFrame
-                    ) {
-                        return target
-                    }
-                }
-                return nil
+                let (candidate, selectionFrame) = targetCandidate
+                return CaptureController.manualLongScreenshotTarget(
+                    windowID: candidate.windowID,
+                    processID: candidate.processID,
+                    selectionFrame: selectionFrame
+                )
             }.value
             guard !Task.isCancelled else { return }
             longScreenshotScrollTarget = resolved

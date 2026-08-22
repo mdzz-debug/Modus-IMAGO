@@ -913,28 +913,32 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
     ) -> ManualLongScreenshotScrollTarget? {
         guard selectionFrame.width >= 40,
               selectionFrame.height >= 40,
-              AXIsProcessTrusted(),
-              let targetWindowFrame = windowFrame(windowID: windowID),
-              let windowElement = accessibilityWindow(
-                windowID: windowID,
-                processID: processID
-              ),
-              let scrollFrame = scrollableFrame(
+              let targetWindowFrame = windowFrame(windowID: windowID) else {
+            return nil
+        }
+        let detectedScrollFrame: CGRect? = if AXIsProcessTrusted(),
+           let windowElement = accessibilityWindow(
+            windowID: windowID,
+            processID: processID
+           ) {
+            scrollableFrame(
                 in: windowElement,
                 intersecting: selectionFrame.offsetBy(
                     dx: targetWindowFrame.minX,
                     dy: targetWindowFrame.minY
                 )
-              ) else {
-            return nil
+            )
+        } else {
+            nil
         }
+        let resolvedFrame = detectedScrollFrame?.offsetBy(
+            dx: -targetWindowFrame.minX,
+            dy: -targetWindowFrame.minY
+        ) ?? selectionFrame
         return ManualLongScreenshotScrollTarget(
             windowID: windowID,
             processID: processID,
-            selectionFrame: scrollFrame.offsetBy(
-                dx: -targetWindowFrame.minX,
-                dy: -targetWindowFrame.minY
-            )
+            selectionFrame: resolvedFrame
         )
     }
 
@@ -954,7 +958,6 @@ final class CaptureController: NSObject, ObservableObject, SCStreamDelegate, SCR
             target = scrollTarget
         }
 
-        raiseWindow(windowID: target.windowID, processID: target.processID)
         movePointerIntoScrollSelection(target)
     }
 
